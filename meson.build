@@ -101,14 +101,22 @@ if get_option('build_static_lib')
   static_blake3_lib = static_library('blake3', blake3_sources, c_args: simd_args + simd_defines, install: true)
 endif
 
-if get_option('build_shared_lib')
-  shared_blake3_lib = shared_library('blake3', blake3_sources, c_args: simd_args + simd_defines, install: true)
-  versioned_lib = shared_blake3_lib.full_path()  # This is something like libblake3.so.1.0.0
-  versioned_lib_base = versioned_lib.split('.')[0]  # Extract base (e.g., libblake3.so)
-  install_symlink('libblake3.so.1', install_dir: get_option('libdir'), pointing_to: versioned_lib_base + '.1.0.0')
-  install_symlink('libblake3.so', install_dir: get_option('libdir'), pointing_to: versioned_lib_base + '.1')
-endif
+libblake3 = shared_library(
+  'blake3',
+  blake3_sources,
+  version: '1.0.0',
+  soversion: '1',
+  install: true,
+  install_dir: get_option('libdir'),
+  gnu_symbol_visibility: 'hidden',
+)
 
+if get_option('build_shared_lib')
+
+  install_symlink('libblake3.so', install_dir: get_option('libdir'), pointing_to: 'libblake3.so.1')
+
+  install_symlink('libblake3.so.1', install_dir: get_option('libdir'), pointing_to: 'libblake3.so.1.0.0')
+endif
 
 if get_option('build_static_b3sum')
 
@@ -117,7 +125,7 @@ if get_option('build_static_b3sum')
 else
 
   b3sum_c_args = []
-  b3sum_lib = shared_blake3_lib
+  b3sum_lib = libblake3
 endif
 
 executable('b3sum',
