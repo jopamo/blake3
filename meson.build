@@ -1,5 +1,5 @@
 project('b3sum', 'c',
-  version: '20250616',
+  version: 'VERSION',
   default_options: ['buildtype=release', 'c_std=c11', 'default_library=shared'])
 
 musl_cc = find_program('musl-gcc', required: get_option('build_static_b3sum'))
@@ -28,7 +28,7 @@ elif host_machine.cpu_family() == 'arm' or host_machine.cpu_family() == 'aarch64
   ]
 endif
 
-check_simd_prog = find_program('share/check_cpu_features.py')
+check_simd_prog = find_program('src/check_cpu_features.py')
 simd_output = run_command(check_simd_prog, check: true).stdout().strip().splitlines()
 
 sse2_supported = false
@@ -88,15 +88,13 @@ foreach a : maybe_args
   endif
 endforeach
 
-#  Enable linker GC if supported
 if cc.get_id() in ['gcc', 'clang']
   add_project_link_arguments('-Wl,--gc-sections', language : 'c')
 endif
 
-#  Enable LTO (can also be toggled via -Db_lto=true)
 if cc.has_argument('-flto')
-  add_project_arguments('-flto',            language : 'c')
-  add_project_link_arguments('-flto',       language : 'c')
+  add_project_arguments('-flto', language : 'c')
+  add_project_link_arguments('-flto', language : 'c')
 endif
 
 if get_option('build_static_lib')
@@ -105,15 +103,16 @@ endif
 
 if get_option('build_shared_lib')
   shared_blake3_lib = shared_library('blake3', blake3_sources, c_args: simd_args + simd_defines, install: true)
+  install_symlink('libblake3.so', install_dir: join_paths(get_option('libdir'), 'lib'), pointing_to: shared_blake3_lib.full_path())
 endif
 
 if get_option('build_static_b3sum')
-  # If building static b3sum, link against the static library and use musl-gcc
-  b3sum_c_args = ['-static']  # Ensure fully static linking
+
+  b3sum_c_args = ['-static']
   b3sum_lib = static_blake3_lib
 else
-  # Otherwise, link against the shared library
-  b3sum_c_args = []  # No special flags for dynamic linking
+
+  b3sum_c_args = []
   b3sum_lib = shared_blake3_lib
 endif
 
@@ -123,7 +122,19 @@ executable('b3sum',
   dependencies: [],
   install: true,
   c_args: simd_args + simd_defines + b3sum_c_args,
-  override_options: ['b_lundef=false', 'b_staticpic=false']  # Ensure no undefined symbols for static linking
+  override_options: ['b_lundef=false', 'b_staticpic=false']
+)
+
+install_headers('src/blake3.h', subdir: 'b3sum')
+
+pkg = import('pkgconfig')
+pkg.generate(
+  name: 'blake3',
+  description: 'BLAKE3 hash function library',
+  version: meson.project_version(),
+  libraries: ['-lblake3'],
+  extra_cflags: simd_args + maybe_args,
+  install_dir: join_paths(get_option('prefix'), 'lib/pkgconfig')
 )
 
 summary({

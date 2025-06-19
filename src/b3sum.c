@@ -1,74 +1,5 @@
 /*
-b3sum:
-Usage: b3sum [OPTION]... [FILE]...
-Print or check BLAKE3 (256-bit) checksums.
-
-With no FILE, or when FILE is -, read standard input.
-  -c, --check           read checksums from the FILEs and check them
-      --tag             create a BSD-style checksum
-  -z, --zero            end each output line with NUL, not newline,
-                          and disable file name escaping
-
-The following five options are useful only when verifying checksums:
-      --ignore-missing  don't fail or report status for missing files
-      --quiet           don't print OK for each successfully verified file
-      --status          don't output anything, status code shows success
-      --strict          exit non-zero for improperly formatted checksum lines
-  -w, --warn            warn about improperly formatted checksum lines
-
-      --help        display this help and exit
-      --version     output version information and exit
-
-
-BLAKE3 API
-#define BLAKE3_20250616_STRING "1.8.2"
-#define sBLAKE3_KEY_LEN 32
-#define BLAKE3_OUT_LEN 32
-#define BLAKE3_BLOCK_LEN 64
-#define BLAKE3_CHUNK_LEN 1024
-#define BLAKE3_MAX_DEPTH 54
-
-// This struct is a private implementation detail. It has to be here because
-// it's part of blake3_hasher below.
-typedef struct {
-  uint32_t cv[8];
-  uint64_t chunk_counter;
-  uint8_t buf[BLAKE3_BLOCK_LEN];
-  uint8_t buf_len;
-  uint8_t blocks_compressed;
-  uint8_t flags;
-} blake3_chunk_state;
-
-typedef struct {
-  uint32_t key[8];
-  blake3_chunk_state chunk;
-  uint8_t cv_stack_len;
-  // The stack size is MAX_DEPTH + 1 because we do lazy merging. For example,
-  // with 7 chunks, we have 3 entries in the stack. Adding an 8th chunk
-  // requires a 4th entry, rather than merging everything down to 1, because we
-  // don't know whether more input is coming. This is different from how the
-  // reference implementation does things.
-  uint8_t cv_stack[(BLAKE3_MAX_DEPTH + 1) * BLAKE3_OUT_LEN];
-} blake3_hasher;
-
-BLAKE3_API const char *blake3_version(void);
-BLAKE3_API void blake3_hasher_init(blake3_hasher *self);
-BLAKE3_API void blake3_hasher_init_keyed(blake3_hasher *self,
-                                         const uint8_t key[BLAKE3_KEY_LEN]);
-BLAKE3_API void blake3_hasher_init_derive_key(blake3_hasher *self, const char *context);
-BLAKE3_API void blake3_hasher_init_derive_key_raw(blake3_hasher *self, const void *context,
-                                                  size_t context_len);
-BLAKE3_API void blake3_hasher_update(blake3_hasher *self, const void *input,
-                                     size_t input_len);
-#if defined(BLAKE3_USE_TBB)
-BLAKE3_API void blake3_hasher_update_tbb(blake3_hasher *self, const void *input,
-                                         size_t input_len);
-#endif // BLAKE3_USE_TBB
-BLAKE3_API void blake3_hasher_finalize(const blake3_hasher *self, uint8_t *out,
-                                       size_t out_len);
-BLAKE3_API void blake3_hasher_finalize_seek(const blake3_hasher *self, uint64_t seek,
-                                            uint8_t *out, size_t out_len);
-BLAKE3_API void blake3_hasher_reset(blake3_hasher *self);
+b3sum
 */
 
 #define _POSIX_C_SOURCE 200809L
@@ -153,7 +84,7 @@ static void print_help(void) {
 
 /* Print version message. */
 static void print_version(void) {
-  puts("b3sum version 1.1");
+  puts("b3sum version VERSION");
 }
 
 /* Parse command-line options. Returns new optind or 0/negative on help/error. */
