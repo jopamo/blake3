@@ -1,20 +1,35 @@
 project('b3sum', 'c',
-  version: 'VERSION',
-  default_options: ['buildtype=release', 'c_std=c11', 'default_library=shared'])
+  version: '1.0.0',
+  meson_version: '>=1.2.0',
+  default_options: [
+    'buildtype=release',
+    'c_std=c17',
+    'default_library=shared',
+  ]
+)
 
-musl_cc = find_program('musl-gcc', required: get_option('build_static_b3sum'))
+fs = import('fs')
+cc = meson.get_compiler('c')
+debug_sanitize = get_option('debug_sanitize')
 
-cc = musl_cc.found() and get_option('build_static_b3sum') ? musl_cc : meson.get_compiler('c')
+if debug_sanitize and cc.get_id() != 'clang'
+  error('debug_sanitize option requires clang (set CC=clang when running meson setup)')
+endif
 
+project_c_args = []
+project_link_args = []
 simd_args = []
 simd_defines = []
 
+# core blake3 sources
 blake3_sources = [
   'src/blake3.c',
   'src/blake3_dispatch.c',
   'src/blake3_portable.c',
 ]
 
+# arch-specific implementations are always compiled
+# runtime dispatch in blake3_dispatch.c should pick the best path at runtime
 if host_machine.cpu_family() == 'x86_64'
   blake3_sources += [
     'src/blake3_sse2_x86-64_unix.S',
@@ -22,84 +37,84 @@ if host_machine.cpu_family() == 'x86_64'
     'src/blake3_avx2_x86-64_unix.S',
     'src/blake3_avx512_x86-64_unix.S',
   ]
-elif host_machine.cpu_family() == 'arm' or host_machine.cpu_family() == 'aarch64'
-  blake3_sources += [
-    'src/blake3_neon.c',
-  ]
-endif
 
-check_simd_prog = find_program('src/check_cpu_features.py')
-simd_output = run_command(check_simd_prog, check: true).stdout().strip().splitlines()
+  # we do NOT inject -mavx2/-mavx512f globally because that would make the whole binary require them
+  # keep simd_args empty for portability and let the asm be written with explicit .target/.arch
+elif host_machine.cpu_family() in ['arm', 'aarch64']
+  blake3_sources += ['src/blake3_neon.c']
 
-sse2_supported = false
-sse41_supported = false
-avx2_supported = false
-avx512_supported = false
-
-foreach line : simd_output
-  parts = line.split(':')
-  if parts.length() == 2
-    feature = parts[0].strip()
-    supported = parts[1].strip() == 'Supported'
-    if feature == 'sse2'
-      sse2_supported = supported
-    elif feature == 'sse4.1'
-      sse41_supported = supported
-    elif feature == 'avx2'
-      avx2_supported = supported
-    elif feature == 'avx512'
-      avx512_supported = supported
+  # on aarch64 NEON is baseline, no flag needed
+  if host_machine.cpu_family() == 'arm'
+    if cc.has_argument('-mfpu=neon')
+      simd_args += ['-mfpu=neon']
     endif
   endif
-endforeach
-
-if host_machine.cpu_family() == 'x86_64'
-  if sse2_supported
-    simd_args += ['-msse2']
-  endif
-
-  if sse41_supported
-    simd_args += ['-msse4.1']
-  endif
-
-  if avx2_supported
-    simd_args += ['-mavx2']
-  endif
-
-  if avx512_supported
-    simd_args += ['-mavx512f']
-  endif
-elif host_machine.cpu_family() == 'arm' or host_machine.cpu_family() == 'aarch64'
-  if cc.has_argument('-mfpu=neon')
-    simd_args += ['-mfpu=neon']
-  endif
 endif
 
-maybe_args = [
-  '-march=native', '-mtune=native',
+# recommended portable codegen flags
+common_opt_args = [
   '-fno-plt',
   '-ffunction-sections', '-fdata-sections',
   '-falign-functions=32',
 ]
 
-foreach a : maybe_args
+foreach a : common_opt_args
   if cc.has_argument(a)
-    simd_args += [a]
+    project_c_args += [a]
   endif
 endforeach
 
+# sanitizers
+if debug_sanitize
+  sanitize_flags = ['-fsanitize=address', '-fsanitize=undefined']
+
+  foreach flag : sanitize_flags
+    if not cc.has_argument(flag)
+      error('compiler does not support ' + flag)
+    endif
+  endforeach
+
+  if not cc.links('int main(void){return 0;}', args: sanitize_flags)
+    error('failed to link with address/undefined sanitizers')
+  endif
+
+  # we want nice stacks under asan/ubsan
+  project_c_args += sanitize_flags + ['-fno-omit-frame-pointer', '-g']
+  project_link_args += sanitize_flags
+
+  if cc.get_id() == 'clang'
+    if cc.has_link_argument('-shared-libasan')
+      project_link_args += ['-shared-libasan']
+    endif
+    if cc.has_link_argument('-shared-libubsan')
+      project_link_args += ['-shared-libubsan']
+    endif
+  endif
+else
+  # try thin LTO with clang first, then fallback to -flto
+  if cc.get_id() == 'clang'
+    if cc.has_argument('-flto=thin') and cc.links('int main(void){return 0;}', args: ['-flto=thin'])
+      project_c_args += ['-flto=thin']
+      project_link_args += ['-flto=thin']
+    elif cc.has_argument('-flto') and cc.links('int main(void){return 0;}', args: ['-flto'])
+      project_c_args += ['-flto']
+      project_link_args += ['-flto']
+    endif
+  else
+    if cc.has_argument('-flto') and cc.links('int main(void){return 0;}', args: ['-flto'])
+      project_c_args += ['-flto']
+      project_link_args += ['-flto']
+    endif
+  endif
+endif
+
+# gc-sections helps drop unused SIMD variants from final link
 if cc.get_id() in ['gcc', 'clang']
-  add_project_link_arguments('-Wl,--gc-sections', language : 'c')
+  project_link_args += ['-Wl,--gc-sections']
 endif
 
-if cc.has_argument('-flto')
-  add_project_arguments('-flto', language : 'c')
-  add_project_link_arguments('-flto', language : 'c')
-endif
-
-if get_option('build_static_lib')
-  static_blake3_lib = static_library('blake3', blake3_sources, c_args: simd_args + simd_defines, install: true)
-endif
+add_project_arguments(project_c_args, language: 'c')
+add_project_link_arguments(project_link_args, language: 'c')
 
 libblake3 = shared_library(
   'blake3',
@@ -108,35 +123,20 @@ libblake3 = shared_library(
   soversion: '1',
   install: true,
   install_dir: get_option('libdir'),
-  gnu_symbol_visibility: 'hidden',
+  c_args: simd_args + simd_defines
+  # no per-target link_args needed because we already added project_link_args
 )
 
-if get_option('build_shared_lib')
-
-  install_symlink('libblake3.so', install_dir: get_option('libdir'), pointing_to: 'libblake3.so.1')
-
-  install_symlink('libblake3.so.1', install_dir: get_option('libdir'), pointing_to: 'libblake3.so.1.0.0')
-endif
-
-if get_option('build_static_b3sum')
-
-  b3sum_c_args = ['-static']
-  b3sum_lib = static_blake3_lib
-else
-
-  b3sum_c_args = []
-  b3sum_lib = libblake3
-endif
-
-executable('b3sum',
+b3sum_exe = executable(
+  'b3sum',
   ['src/b3sum.c'],
-  link_with: b3sum_lib,
-  dependencies: [],
+  link_with: libblake3,
   install: true,
-  c_args: simd_args + simd_defines + b3sum_c_args,
-  override_options: ['b_lundef=false', 'b_staticpic=false']
+  c_args: simd_args + simd_defines,
+  override_options: ['b_lundef=false']  # avoid unresolved sanitizer stuff
 )
 
+# install public header
 install_headers('src/blake3.h', subdir: 'b3sum')
 
 pkg = import('pkgconfig')
@@ -144,21 +144,16 @@ pkg.generate(
   name: 'blake3',
   description: 'BLAKE3 hash function library',
   version: meson.project_version(),
-  libraries: ['-lblake3'],
-  extra_cflags: simd_args + maybe_args,
-  install_dir: join_paths(get_option('prefix'), 'lib/pkgconfig')
+  libraries: libblake3,
+  extra_cflags: simd_args,
+  install_dir: join_paths(get_option('libdir'), 'pkgconfig')
 )
 
 summary({
-  'SIMD Arguments': simd_args,
-  'BLAKE3 Source Files': blake3_sources,
+  'SIMD compile args': simd_args,
+  'BLAKE3 source files': blake3_sources,
   'Architecture': host_machine.cpu_family(),
-  'SSE2 Enabled': sse2_supported,
-  'SSE4.1 Enabled': sse41_supported,
-  'AVX2 Enabled': avx2_supported,
-  'AVX512 Enabled': avx512_supported,
-  'Build Static Library': get_option('build_static_lib'),
-  'Build Shared Library': get_option('build_shared_lib'),
-  'Build Static b3sum': get_option('build_static_b3sum'),
-  'Using musl-gcc for static b3sum': musl_cc.found()
+  'Sanitizers enabled': debug_sanitize,
+  'Project C flags': project_c_args,
+  'Project link flags': project_link_args,
 })

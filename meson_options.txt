@@ -1,3 +1,1 @@
-option('build_static_lib', type: 'boolean', value: false, description: 'Build static library (libblake3.a)')
-option('build_shared_lib', type: 'boolean', value: true, description: 'Build shared library (libblake3.so)')
-option('build_static_b3sum', type: 'boolean', value: false, description: 'Build statically linked b3sum executable')
+option('debug_sanitize', type: 'boolean', value: false, description: 'Build with clang + address/UB sanitizers and relaxed link rules')
