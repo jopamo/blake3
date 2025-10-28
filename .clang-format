@@ -1,5 +1,10 @@
 ---
 BasedOnStyle: Chromium
+IndentWidth: 4
+ContinuationIndentWidth: 4
+UseTab: Never
+ColumnLimit: 200
+
 BraceWrapping:
   AfterCaseLabel: false
   AfterClass: false
@@ -20,6 +25,5 @@ BraceWrapping:
   SplitEmptyRecord: true
   SplitEmptyNamespace: true
 BreakBeforeBraces: Custom
-ColumnLimit: 120
 IncludeBlocks: Preserve
 SortIncludes: Never
