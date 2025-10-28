@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# bench-b3sum.sh — compare build/b3sum (C) vs b3sum_rust (Rust)
+# tests:
+#   1. large file throughput
+#   2. many tiny files (syscall/dcache bound)
+# attempts to neutralize cache by alternating run order and dropping caches if root
+# now with:
+#   - colorful output + emoji
+#   - hard fail if any hash ever disagrees
+
+set -u  # keep -e off during timing loops so a single failed child doesn't nuke everything
+set -o pipefail
+
+####################################
+# colors / emoji
+####################################
+
+# decide if we should emit color
+use_color=false
+if [[ -t 1 && "${TERM:-}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
+  use_color=true
+fi
+
+if $use_color; then
+  ESC=$'\033'              # literal escape char so no printf backslash decoding needed
+  RED="${ESC}[31;1m"
+  GRN="${ESC}[32;1m"
+  YEL="${ESC}[33;1m"
+  BLU="${ESC}[34;1m"
+  MAG="${ESC}[35;1m"
+  CYN="${ESC}[36;1m"
+  RST="${ESC}[0m"
+else
+  RED=""; GRN=""; YEL=""; BLU=""; MAG=""; CYN=""; RST=""
+fi
+
+ok()   { printf "%s✅ %s%s\n" "$GRN" "$*" "$RST"; }
+warn() { printf "%s⚠️  %s%s\n" "$YEL" "$*" "$RST"; }
+err()  { printf "%s🔥 %s%s\n" "$RED" "$*" "$RST" >&2; }
+info() { printf "%sℹ️  %s%s\n" "$CYN" "$*" "$RST"; }
+sect() { printf "\n%s======== %s ========%s\n\n" "$MAG" "$*" "$RST"; }
+
+####################################
+# config
+####################################
+
+C_IMPL="./build/b3sum"          # C version
+R_IMPL="/usr/bin/b3sum_rust"    # Rust version
+
+ITERS=5                         # runs per target per impl
+SIZES_MIB=(4 8 16 128 512 4096 8192)  # large-file corpus sizes in MiB
+
+SMALLFILES_COUNT=5000           # number of tiny files
+SMALLFILE_MIN=1024              # min size bytes
+SMALLFILE_MAX=4096              # max size bytes
+
+####################################
+# sanity checks
+####################################
+
+require_bin() {
+  local b="$1"
+  local msg="$2"
+  if ! command -v "$b" >/dev/null 2>&1; then
+    err "need $msg ($b not found)"
+    exit 1
+  fi
+}
+
+[[ -x "$C_IMPL" ]] || { err "$C_IMPL not executable"; exit 1; }
+[[ -x "$R_IMPL" ]] || { err "$R_IMPL not executable"; exit 1; }
+
+require_bin /usr/bin/time "/usr/bin/time (GNU time -v)"
+require_bin python3 "python3"
+require_bin stat "stat"
+require_bin awk "awk"
+require_bin dd "dd"
+require_bin truncate "truncate"
+require_bin find "find"
+command -v fallocate >/dev/null 2>&1 || true
+command -v sync >/dev/null 2>&1 || true
+
+CAN_DROP_CACHE=false
+if [[ $(id -u) -eq 0 ]] && [[ -w /proc/sys/vm/drop_caches ]]; then
+  CAN_DROP_CACHE=true
+fi
+
+drop_cache_if_possible() {
+  if $CAN_DROP_CACHE; then
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+  fi
+}
+
+####################################
+# data generation helpers
+####################################
+
+# generate N MiB of random data file
+full_random_file() {
+  local path="$1"
+  local mib="$2"
+  dd if=/dev/urandom of="$path" bs=1M count="$mib" 2>/dev/null
+}
+
+sparse_randomize() {
+  local path="$1"
+  local mib="$2"
+  local stripes=$(( (mib / 32) + 1 ))
+  local i=0
+  while [[ $i -lt $stripes ]]; do
+    local off_mib=$(( RANDOM % (mib>0?mib:1) ))
+    dd if=/dev/urandom of="$path" bs=1M count=1 seek="$off_mib" conv=notrunc 2>/dev/null || true
+    ((i++))
+  done
+}
+
+gen_big_file() {
+  local path="$1"
+  local mib="$2"
+
+  if command -v fallocate >/dev/null 2>&1; then
+    fallocate -l "$((mib * 1024 * 1024))" "$path"
+    if [[ "$mib" -ge 2 ]]; then
+      sparse_randomize "$path" "$mib"
+    else
+      full_random_file "$path" "$mib"
+    fi
+  else
+    full_random_file "$path" "$mib"
+  fi
+
+  truncate -s "$((mib * 1024 * 1024))" "$path" 2>/dev/null || true
+}
+
+gen_small_dir() {
+  local dir="$1"
+  mkdir -p "$dir"
+
+  info "generating $SMALLFILES_COUNT tiny files in $dir 🐜"
+
+  local i=0
+  while [[ $i -lt $SMALLFILES_COUNT ]]; do
+    local path="$dir/f_${i}.bin"
+    local span=$((SMALLFILE_MAX - SMALLFILE_MIN + 1))
+    local rbytes=$(( SMALLFILE_MIN + (RANDOM % span) ))
+
+    dd if=/dev/urandom of="$path" bs=1 count="$rbytes" 2>/dev/null
+    ((i++))
+  done
+}
+
+####################################
+# timing parser / math helpers
+####################################
+
+parse_time_file() {
+  local f="$1"
+  local field="$2" # Elapsed|User|System
+
+  case "$field" in
+    Elapsed)
+      local raw
+      raw=$(grep -E 'Elapsed \(wall clock\) time' "$f" | awk -F': ' '{print $2}')
+      python3 - "$raw" << 'EOF'
+import sys, re
+t = sys.argv[1].strip()
+
+m = re.match(r'^(\d+)m\s+([\d.]+)s$', t)
+if m:
+    mins = float(m.group(1)); secs = float(m.group(2))
+    print(f"{mins*60.0+secs:.6f}")
+    raise SystemExit
+
+parts = t.split(':')
+if len(parts) == 1:
+    s = float(parts[0])
+elif len(parts) == 2:
+    s = float(parts[0])*60.0 + float(parts[1])
+elif len(parts) == 3:
+    s = float(parts[0])*3600.0 + float(parts[1])*60.0 + float(parts[2])
+else:
+    raise SystemExit(f"bad elapsed format: {t!r}")
+print(f"{s:.6f}")
+EOF
+      ;;
+    User)   grep 'User time (seconds)' "$f"   | awk -F': ' '{print $2}' ;;
+    System) grep 'System time (seconds)' "$f" | awk -F': ' '{print $2}' ;;
+  esac
+}
+
+avg_array() {
+  local -n arr="$1"
+  awk -v vals="${arr[*]}" 'BEGIN {
+    n=split(vals,v," "); s=0
+    for(i=1;i<=n;i++) s+=v[i]
+    if(n>0) printf "%.6f", s/n
+  }'
+}
+
+####################################
+# sandbox prep
+####################################
+
+SANDBOX="$(mktemp -d /tmp/b3bench.XXXXXX)"
+trap 'rm -rf "$SANDBOX"' EXIT
+
+info "sandbox: ${BLU}$SANDBOX${RST}"
+$CAN_DROP_CACHE || warn "cannot drop_caches, results include warm cache effects"
+info "creating random test set... 🎲"
+echo
+
+declare -a FILES=()
+
+# large blobs
+for sz in "${SIZES_MIB[@]}"; do
+  f="$SANDBOX/file_${sz}MiB.bin"
+  info "creating $f (${sz} MiB)"
+  gen_big_file "$f" "$sz"
+  FILES+=("$f")
+done
+
+# tiny-file corpus
+SMALLDIR="$SANDBOX/smallfiles"
+gen_small_dir "$SMALLDIR"
+
+FILELIST="$SANDBOX/smallfiles.list"
+find "$SMALLDIR" -maxdepth 1 -type f | sort > "$FILELIST"
+SMALLFILES_ACTUAL=$(wc -l < "$FILELIST")
+
+# create helper runner script for tiny-files hashing
+RUN_SMALL_SCRIPT="$SANDBOX/run_small_batch.sh"
+cat > "$RUN_SMALL_SCRIPT" << 'EOS'
+#!/usr/bin/env bash
+set -u
+impl="$1"
+list="$2"
+# feed the hasher in chunks so we don't blow ARG_MAX
+# stdout discarded by caller
+xargs -a "$list" -n256 -r "$impl" >/dev/null
+EOS
+chmod +x "$RUN_SMALL_SCRIPT"
+
+####################################
+# LARGE FILE BENCH
+####################################
+
+sect "large-file benchmark (throughput bound 🚀)"
+
+declare -a overall_c_tp
+declare -a overall_r_tp
+declare -a overall_c_real
+declare -a overall_r_real
+
+run_hasher_once() {
+  local impl="$1"
+  local file="$2"
+  local outfile="$3"
+
+  # python wrapper to get high-res timings and rusage, also capture exit
+  python3 - "$outfile" "$impl" "$file" <<'PY'
+import resource, subprocess, sys, time
+
+out_path = sys.argv[1]
+cmd = sys.argv[2:]
+
+start_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+start_ns = time.perf_counter_ns()
+
+proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    ret = proc.wait()
+finally:
+    end_ns = time.perf_counter_ns()
+    end_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+
+elapsed_sec = (end_ns - start_ns) / 1e9
+user_sec = end_usage.ru_utime - start_usage.ru_utime
+sys_sec = end_usage.ru_stime - start_usage.ru_stime
+
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(f"Command being timed: {' '.join(cmd)}\n")
+    f.write(f"Exit status: {ret}\n")
+    f.write(f"Elapsed (wall clock) time: {elapsed_sec:.9f}\n")
+    f.write(f"User time (seconds): {user_sec:.9f}\n")
+    f.write(f"System time (seconds): {sys_sec:.9f}\n")
+
+sys.exit(ret)
+PY
+}
+
+for FILE in "${FILES[@]}"; do
+  SIZE_BYTES=$(stat -c '%s' "$FILE")
+  SIZE_MIB=$(awk -v b="$SIZE_BYTES" 'BEGIN { printf "%.3f", b/1024/1024 }')
+
+  printf "%sfile:%s %s (%s MiB)\n" "$BLU" "$RST" "$FILE" "$SIZE_MIB"
+
+  HASH_C=$("$C_IMPL" "$FILE" | awk '{print $1}')
+  HASH_R=$("$R_IMPL" "$FILE" | awk '{print $1}')
+
+  printf "    C:    %s%s%s\n"   "$YEL" "$HASH_C" "$RST"
+  printf "    Rust: %s%s%s\n"   "$YEL" "$HASH_R" "$RST"
+
+  if [[ "$HASH_C" != "$HASH_R" ]]; then
+    err "hash mismatch on $FILE ❌
+C:    $HASH_C
+Rust: $HASH_R
+bailing out for safety"
+    exit 1
+  fi
+  ok "hash match ok 🧪"
+
+  echo
+
+  c_real_times=()
+  r_real_times=()
+  c_user_times=()
+  r_user_times=()
+  c_sys_times=()
+  r_sys_times=()
+  c_tps=()
+  r_tps=()
+
+  i=1
+  while [[ $i -le $ITERS ]]; do
+    # alternate who is first to shake cache effects
+    if (( i % 2 == 1 )); then
+      first_impl="$C_IMPL"; first_out="C_big_${i}.time.txt"
+      second_impl="$R_IMPL"; second_out="R_big_${i}.time.txt"
+    else
+      first_impl="$R_IMPL"; first_out="R_big_${i}.time.txt"
+      second_impl="$C_IMPL"; second_out="C_big_${i}.time.txt"
+    fi
+
+    run_hasher_once "$first_impl" "$FILE" "$SANDBOX/$first_out"
+    rc1=$?
+    drop_cache_if_possible
+    run_hasher_once "$second_impl" "$FILE" "$SANDBOX/$second_out"
+    rc2=$?
+    drop_cache_if_possible
+
+    if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
+      err "nonzero exit from hasher on $FILE (iter $i) ❌"
+      exit 1
+    fi
+
+    # parse C results
+    c_real=$(parse_time_file "$SANDBOX/C_big_${i}.time.txt" Elapsed)
+    c_user=$(parse_time_file "$SANDBOX/C_big_${i}.time.txt" User)
+    c_sys=$(parse_time_file "$SANDBOX/C_big_${i}.time.txt" System)
+    c_tp=$(awk -v m="$SIZE_MIB" -v s="$c_real" 'BEGIN { if (s>0) printf "%.2f", m/s; else print "inf" }')
+
+    # parse Rust results
+    r_real=$(parse_time_file "$SANDBOX/R_big_${i}.time.txt" Elapsed)
+    r_user=$(parse_time_file "$SANDBOX/R_big_${i}.time.txt" User)
+    r_sys=$(parse_time_file "$SANDBOX/R_big_${i}.time.txt" System)
+    r_tp=$(awk -v m="$SIZE_MIB" -v s="$r_real" 'BEGIN { if (s>0) printf "%.2f", m/s; else print "inf" }')
+
+    c_real_times+=("$c_real"); c_user_times+=("$c_user"); c_sys_times+=("$c_sys"); c_tps+=("$c_tp")
+    r_real_times+=("$r_real"); r_user_times+=("$r_user"); r_sys_times+=("$r_sys"); r_tps+=("$r_tp")
+
+    i=$((i+1))
+  done
+
+  avg_c_real=$(avg_array c_real_times)
+  avg_r_real=$(avg_array r_real_times)
+  avg_c_user=$(avg_array c_user_times)
+  avg_r_user=$(avg_array r_user_times)
+  avg_c_sys=$(avg_array c_sys_times)
+  avg_r_sys=$(avg_array r_sys_times)
+  avg_c_tp=$(avg_array c_tps)
+  avg_r_tp=$(avg_array r_tps)
+
+  speedup=$(awk -v c="$avg_c_real" -v r="$avg_r_real" 'BEGIN { if (c>0) printf "%.3f", r/c; else print "inf" }')
+
+  printf "  %sC impl   %s: real %ss  user %ss  sys %ss  thr %s MiB/s\n" \
+    "$GRN" "$RST" "$avg_c_real" "$avg_c_user" "$avg_c_sys" "$avg_c_tp"
+  printf "  %sRust impl%s: real %ss  user %ss  sys %ss  thr %s MiB/s\n" \
+    "$GRN" "$RST" "$avg_r_real" "$avg_r_user" "$avg_r_sys" "$avg_r_tp"
+  printf "  %sspeedup (Rust_real / C_real):%s %s%sx%s ⚖️\n" \
+    "$MAG" "$RST" "$MAG" "$speedup" "$RST"
+  echo
+
+  overall_c_tp+=("$avg_c_tp")
+  overall_r_tp+=("$avg_r_tp")
+  overall_c_real+=("$avg_c_real")
+  overall_r_real+=("$avg_r_real")
+done
+
+# rollup big
+if ((${#overall_c_tp[@]} > 0)); then
+  oc_tp=$(avg_array overall_c_tp)
+  or_tp=$(avg_array overall_r_tp)
+  oc_real=$(avg_array overall_c_real)
+  or_real=$(avg_array overall_r_real)
+  overall_speedup=$(awk -v c="$oc_real" -v r="$or_real" 'BEGIN { if (c>0) printf "%.3f", r/c; else print "inf" }')
+else
+  oc_tp="n/a"
+  or_tp="n/a"
+  oc_real="n/a"
+  or_real="n/a"
+  overall_speedup="n/a"
+fi
+
+####################################
+# SMALL FILE BENCH
+####################################
+
+sect "tiny-file benchmark (syscall bound 🐜)"
+
+info "target dir: $SMALLDIR ($SMALLFILES_ACTUAL files)"
+info "ITERs: $ITERS  alt order, cache drop=$CAN_DROP_CACHE"
+echo
+
+run_small_once() {
+  local impl="$1"
+  local outfile="$2"
+  /usr/bin/time -v "$RUN_SMALL_SCRIPT" "$impl" "$FILELIST" >/dev/null 2>"$outfile"
+}
+
+c_small_real_times=()
+r_small_real_times=()
+c_small_user_times=()
+r_small_user_times=()
+c_small_sys_times=()
+r_small_sys_times=()
+
+i=1
+while [[ $i -le $ITERS ]]; do
+  if (( i % 2 == 1 )); then
+    first_impl="$C_IMPL"; first_out="C_small_${i}.time.txt"
+    second_impl="$R_IMPL"; second_out="R_small_${i}.time.txt"
+  else
+    first_impl="$R_IMPL"; first_out="R_small_${i}.time.txt"
+    second_impl="$C_IMPL"; second_out="C_small_${i}.time.txt"
+  fi
+
+  run_small_once "$first_impl" "$SANDBOX/$first_out"; rc1=$?
+  drop_cache_if_possible
+  run_small_once "$second_impl" "$SANDBOX/$second_out"; rc2=$?
+  drop_cache_if_possible
+
+  if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
+    err "nonzero exit from tiny-file batch (iter $i) ❌"
+    exit 1
+  fi
+
+  c_real=$(parse_time_file "$SANDBOX/C_small_${i}.time.txt" Elapsed)
+  c_user=$(parse_time_file "$SANDBOX/C_small_${i}.time.txt" User)
+  c_sys=$(parse_time_file "$SANDBOX/C_small_${i}.time.txt" System)
+
+  r_real=$(parse_time_file "$SANDBOX/R_small_${i}.time.txt" Elapsed)
+  r_user=$(parse_time_file "$SANDBOX/R_small_${i}.time.txt" User)
+  r_sys=$(parse_time_file "$SANDBOX/R_small_${i}.time.txt" System)
+
+  c_small_real_times+=("$c_real"); c_small_user_times+=("$c_user"); c_small_sys_times+=("$c_sys")
+  r_small_real_times+=("$r_real"); r_small_user_times+=("$r_user"); r_small_sys_times+=("$r_sys")
+
+  i=$((i+1))
+done
+
+avg_c_small_real=$(avg_array c_small_real_times)
+avg_r_small_real=$(avg_array r_small_real_times)
+avg_c_small_user=$(avg_array c_small_user_times)
+avg_r_small_user=$(avg_array r_small_user_times)
+avg_c_small_sys=$(avg_array c_small_sys_times)
+avg_r_small_sys=$(avg_array r_small_sys_times)
+
+c_files_per_s=$(awk -v files="$SMALLFILES_ACTUAL" -v s="$avg_c_small_real" 'BEGIN { if (s>0) printf "%.2f", files/s; else print "inf" }')
+r_files_per_s=$(awk -v files="$SMALLFILES_ACTUAL" -v s="$avg_r_small_real" 'BEGIN { if (s>0) printf "%.2f", files/s; else print "inf" }')
+
+small_speedup=$(awk -v c="$avg_c_small_real" -v r="$avg_r_small_real" 'BEGIN { if (c>0) printf "%.3f", r/c; else print "inf" }')
+
+printf "%sC impl tiny-files   %s: real %ss  user %ss  sys %ss  rate %s files/s (%d files)\n" \
+  "$GRN" "$RST" "$avg_c_small_real" "$avg_c_small_user" "$avg_c_small_sys" "$c_files_per_s" "$SMALLFILES_ACTUAL"
+
+printf "%sRust impl tiny-files%s: real %ss  user %ss  sys %ss  rate %s files/s (%d files)\n" \
+  "$GRN" "$RST" "$avg_r_small_real" "$avg_r_small_user" "$avg_r_small_sys" "$r_files_per_s" "$SMALLFILES_ACTUAL"
+
+printf "%stiny-file speedup (Rust_real / C_real):%s %s%sx%s 🏎️\n" \
+  "$MAG" "$RST" "$MAG" "$small_speedup" "$RST"
+
+####################################
+# OVERALL SUMMARY
+####################################
+
+sect "overall summary 📊"
+
+printf "  %sLARGE FILES%s:\n" "$BLU" "$RST"
+printf "    C impl   : avg real %ss  avg thr %s MiB/s\n" "$oc_real" "$oc_tp"
+printf "    Rust impl: avg real %ss  avg thr %s MiB/s\n" "$or_real" "$or_tp"
+printf "    speedup (Rust_real / C_real): %s%sx%s\n" "$MAG" "$overall_speedup" "$RST"
+
+echo
+printf "  %sTINY FILES%s:\n" "$BLU" "$RST"
+printf "    C impl   : avg real %ss  rate %s files/s\n" "$avg_c_small_real" "$c_files_per_s"
+printf "    Rust impl: avg real %ss  rate %s files/s\n" "$avg_r_small_real" "$r_files_per_s"
+printf "    speedup (Rust_real / C_real): %s%sx%s\n" "$MAG" "$small_speedup" "$RST"
+
+echo
+ok "done ✨"
