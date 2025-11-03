@@ -1,0 +1,21 @@
+# Ignore object files
+*.o
+
+# Ignore static libraries
+*.a
+
+# Ignore the final executable binary
+traceroute/traceroute
+
+# Ignore build directories (if applicable)
+build/
+out/
+
+# Ignore editor files (e.g., vim, emacs)
+*.swp
+*.swo
+*~
+
+# Ignore IDE specific files (if applicable)
+.vscode/
+.idea/
