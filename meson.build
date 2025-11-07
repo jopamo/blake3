@@ -124,7 +124,6 @@ libblake3 = shared_library(
   install: true,
   install_dir: get_option('libdir'),
   c_args: simd_args + simd_defines
-  # no per-target link_args needed because we already added project_link_args
 )
 
 b3sum_exe = executable(
@@ -133,7 +132,7 @@ b3sum_exe = executable(
   link_with: libblake3,
   install: true,
   c_args: simd_args + simd_defines,
-  override_options: ['b_lundef=false']  # avoid unresolved sanitizer stuff
+  override_options: ['b_lundef=false']
 )
 
 # install public header
