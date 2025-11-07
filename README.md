@@ -91,8 +91,7 @@ void blake3_hasher_update(
 ```
 
 Add input to the hasher. This can be called any number of times. This function
-is always single-threaded; for multithreading see `blake3_hasher_update_tbb`
-below.
+is always single-threaded.
 
 
 ---
@@ -161,44 +160,6 @@ Application code in C should prefer `blake3_hasher_init_derive_key`,
 which takes the context as a C string. If you need to use arbitrary
 bytes as a context string in application code, consider whether you're
 violating the requirement that context strings should be hardcoded.
-
----
-
-```c
-void blake3_hasher_update_tbb(
-  blake3_hasher *self,
-  const void *input,
-  size_t input_len);
-```
-
-Add input to the hasher, using [oneTBB] to process large inputs using multiple
-threads. This can be called any number of times. This gives the same result as
-`blake3_hasher_update` above.
-
-[oneTBB]: https://uxlfoundation.github.io/oneTBB/
-
-NOTE: This function is only enabled when the library is compiled with CMake option `BLAKE3_USE_TBB`
-and when the oneTBB library is detected on the host system. See the building instructions for
-further details.
-
-To get any performance benefit from multithreading, the input buffer needs to
-be large. As a rule of thumb on x86_64, `blake3_hasher_update_tbb` is _slower_
-than `blake3_hasher_update` for inputs under 128 KiB. That threshold varies
-quite a lot across different processors, and it's important to benchmark your
-specific use case.
-
-Hashing large files with this function usually requires
-[memory-mapping](https://en.wikipedia.org/wiki/Memory-mapped_file), since
-reading a file into memory in a single-threaded loop takes longer than hashing
-the resulting buffer. Note that hashing a memory-mapped file with this function
-produces a "random" pattern of disk reads, which can be slow on spinning disks.
-Again it's important to benchmark your specific use case.
-
-This implementation doesn't require configuration of thread resources and will
-use as many cores as possible by default. More fine-grained control of
-resources is possible using the [oneTBB] API.
-
----
 
 ```c
 void blake3_hasher_finalize_seek(
@@ -270,14 +231,12 @@ cmake --build . --target install
 
 The following options are available when compiling with CMake:
 
-- `BLAKE3_USE_TBB`: Enable oneTBB parallelism (Requires a C++20 capable compiler)
-- `BLAKE3_FETCH_TBB`: Allow fetching oneTBB from GitHub (only if not found on system)
 - `BLAKE3_EXAMPLES`: Compile and install example programs
 
 Options can be enabled like this:
 
 ```bash
-cmake -S c -B c/build "-DCMAKE_INSTALL_PREFIX=/usr/local" -DBLAKE3_USE_TBB=1 -DBLAKE3_FETCH_TBB=1
+cmake -S c -B c/build "-DCMAKE_INSTALL_PREFIX=/usr/local" -DBLAKE3_EXAMPLES=1
 ```
 
 ## Building manually
@@ -381,23 +340,3 @@ example:
 ```bash
 gcc -shared -O3 -o libblake3.so blake3.c blake3_dispatch.c blake3_portable.c
 ```
-
-### Multithreading
-
-Multithreading is available using [oneTBB], by compiling the optional C++
-support file [`blake3_tbb.cpp`](./blake3_tbb.cpp). For an example of using
-`mmap` (non-Windows) and `blake3_hasher_update_tbb` to get large-file
-performance on par with [`b3sum`](../b3sum), see
-[`example_tbb.c`](./example_tbb.c). You can build it like this:
-
-```bash
-g++ -c -O3 -fno-exceptions -fno-rtti -DBLAKE3_USE_TBB -o blake3_tbb.o blake3_tbb.cpp
-gcc -O3 -o example_tbb -lstdc++ -ltbb -DBLAKE3_USE_TBB blake3_tbb.o example_tbb.c blake3.c \
-    blake3_dispatch.c blake3_portable.c blake3_sse2_x86-64_unix.S blake3_sse41_x86-64_unix.S \
-    blake3_avx2_x86-64_unix.S blake3_avx512_x86-64_unix.S
-```
-
-NOTE: `-fno-exceptions` or equivalent is required to compile `blake3_tbb.cpp`,
-and public API methods with external C linkage are marked `noexcept`. Compiling
-that file with exceptions enabled will fail. Compiling with RTTI disabled isn't
-required but is recommended for code size.

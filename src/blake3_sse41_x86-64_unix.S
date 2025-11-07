@@ -19,11 +19,15 @@
 .global _blake3_compress_in_place_sse41
 .global blake3_compress_xof_sse41
 .global _blake3_compress_xof_sse41
-
+#ifdef __APPLE__
+.text
+#else
 .section .text
+#endif
         .p2align  6
 _blake3_hash_many_sse41:
 blake3_hash_many_sse41:
+        _CET_ENDBR
         push    r15
         push    r14
         push    r13
@@ -1785,6 +1789,7 @@ blake3_hash_many_sse41:
 .p2align 6
 blake3_compress_in_place_sse41:
 _blake3_compress_in_place_sse41:
+        _CET_ENDBR
         movups  xmm0, xmmword ptr [rdi]
         movups  xmm1, xmmword ptr [rdi+0x10]
         movaps  xmm2, xmmword ptr [BLAKE3_IV+rip]
@@ -1885,6 +1890,7 @@ _blake3_compress_in_place_sse41:
 .p2align 6
 blake3_compress_xof_sse41:
 _blake3_compress_xof_sse41:
+        _CET_ENDBR
         movups  xmm0, xmmword ptr [rdi]
         movups  xmm1, xmmword ptr [rdi+0x10]
         movaps  xmm2, xmmword ptr [BLAKE3_IV+rip]
@@ -1991,8 +1997,11 @@ _blake3_compress_xof_sse41:
         ret
 
 
+#ifdef __APPLE__
+.static_data
+#else
 .section .rodata
-
+#endif
 .p2align  6
 BLAKE3_IV:
         .long  0x6A09E667, 0xBB67AE85
@@ -2001,7 +2010,7 @@ ROT16:
         .byte  2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13
 ROT8:
         .byte  1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12
-ADD0:
+ADD0:	
         .long  0, 1, 2, 3
 ADD1:
 	.long  4, 4, 4, 4

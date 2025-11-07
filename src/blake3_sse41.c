@@ -431,12 +431,9 @@ INLINE void load_counters(uint64_t counter, bool increment_counter, __m128i* out
     const __m128i mask = _mm_set1_epi32(-(int32_t)increment_counter);
     const __m128i add0 = _mm_set_epi32(3, 2, 1, 0);
     const __m128i add1 = _mm_and_si128(mask, add0);
-
-    // Adjust counter and handle possible carry over
     __m128i l = _mm_add_epi32(_mm_set1_epi32((int32_t)counter), add1);
     __m128i carry = _mm_cmpgt_epi32(_mm_xor_si128(add1, _mm_set1_epi32(0x80000000)), _mm_xor_si128(l, _mm_set1_epi32(0x80000000)));
     __m128i h = _mm_sub_epi32(_mm_set1_epi32((int32_t)(counter >> 32)), carry);
-
     *out_lo = l;
     *out_hi = h;
 }
@@ -446,49 +443,46 @@ blake3_hash4_sse41(const uint8_t* const* inputs, size_t blocks, const uint32_t k
     __m128i h_vecs[8] = {
         set1(key[0]), set1(key[1]), set1(key[2]), set1(key[3]), set1(key[4]), set1(key[5]), set1(key[6]), set1(key[7]),
     };
-
     __m128i counter_low_vec, counter_high_vec;
     load_counters(counter, increment_counter, &counter_low_vec, &counter_high_vec);
-
     uint8_t block_flags = flags | flags_start;
 
-    // Process each block
     for (size_t block = 0; block < blocks; block++) {
-        // Set end flag for the last block
         if (block + 1 == blocks) {
             block_flags |= flags_end;
         }
-
         __m128i block_len_vec = set1(BLAKE3_BLOCK_LEN);
         __m128i block_flags_vec = set1(block_flags);
         __m128i msg_vecs[16];
-
-        // Load and transpose message vectors
         transpose_msg_vecs(inputs, block * BLAKE3_BLOCK_LEN, msg_vecs);
 
-        // Initialize round vectors
         __m128i v[16] = {
             h_vecs[0],   h_vecs[1],   h_vecs[2],   h_vecs[3],   h_vecs[4],       h_vecs[5],        h_vecs[6],     h_vecs[7],
             set1(IV[0]), set1(IV[1]), set1(IV[2]), set1(IV[3]), counter_low_vec, counter_high_vec, block_len_vec, block_flags_vec,
         };
-
-        // Perform rounds
-        for (size_t i = 0; i < 7; ++i) {
-            round_fn(v, msg_vecs, i);
-        }
-
-        // Update hash vectors after rounds
-        for (int i = 0; i < 8; i++) {
-            h_vecs[i] = xorv(v[i], v[i + 8]);
-        }
+        round_fn(v, msg_vecs, 0);
+        round_fn(v, msg_vecs, 1);
+        round_fn(v, msg_vecs, 2);
+        round_fn(v, msg_vecs, 3);
+        round_fn(v, msg_vecs, 4);
+        round_fn(v, msg_vecs, 5);
+        round_fn(v, msg_vecs, 6);
+        h_vecs[0] = xorv(v[0], v[8]);
+        h_vecs[1] = xorv(v[1], v[9]);
+        h_vecs[2] = xorv(v[2], v[10]);
+        h_vecs[3] = xorv(v[3], v[11]);
+        h_vecs[4] = xorv(v[4], v[12]);
+        h_vecs[5] = xorv(v[5], v[13]);
+        h_vecs[6] = xorv(v[6], v[14]);
+        h_vecs[7] = xorv(v[7], v[15]);
 
         block_flags = flags;
     }
 
-    // Transpose and store the result
     transpose_vecs(&h_vecs[0]);
     transpose_vecs(&h_vecs[4]);
-
+    // The first four vecs now contain the first half of each output, and the
+    // second four vecs contain the second half of each output.
     storeu(h_vecs[0], &out[0 * sizeof(__m128i)]);
     storeu(h_vecs[4], &out[1 * sizeof(__m128i)]);
     storeu(h_vecs[1], &out[2 * sizeof(__m128i)]);
@@ -503,20 +497,15 @@ INLINE void hash_one_sse41(const uint8_t* input, size_t blocks, const uint32_t k
     uint32_t cv[8];
     memcpy(cv, key, BLAKE3_KEY_LEN);
     uint8_t block_flags = flags | flags_start;
-
-    // Reduce redundant checks by optimizing block processing
-    for (size_t i = 0; i < blocks; i++) {
-        if (i == blocks - 1) {
+    while (blocks > 0) {
+        if (blocks == 1) {
             block_flags |= flags_end;
         }
         blake3_compress_in_place_sse41(cv, input, BLAKE3_BLOCK_LEN, counter, block_flags);
-        input += BLAKE3_BLOCK_LEN;  // Increment pointer by block size
+        input = &input[BLAKE3_BLOCK_LEN];
+        blocks -= 1;
         block_flags = flags;
-        if (i == blocks - 1) {
-            break;
-        }
     }
-
     memcpy(out, cv, BLAKE3_OUT_LEN);
 }
 
@@ -530,7 +519,6 @@ void blake3_hash_many_sse41(const uint8_t* const* inputs,
                             uint8_t flags_start,
                             uint8_t flags_end,
                             uint8_t* out) {
-    // Process multiple inputs in batches to minimize overhead
     while (num_inputs >= DEGREE) {
         blake3_hash4_sse41(inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
         if (increment_counter) {
@@ -538,15 +526,15 @@ void blake3_hash_many_sse41(const uint8_t* const* inputs,
         }
         inputs += DEGREE;
         num_inputs -= DEGREE;
-        out += DEGREE * BLAKE3_OUT_LEN;  // Move output pointer efficiently
+        out = &out[DEGREE * BLAKE3_OUT_LEN];
     }
-
-    // Process any remaining inputs
-    for (size_t i = 0; i < num_inputs; i++) {
-        hash_one_sse41(inputs[i], blocks, key, counter, flags, flags_start, flags_end, out);
+    while (num_inputs > 0) {
+        hash_one_sse41(inputs[0], blocks, key, counter, flags, flags_start, flags_end, out);
         if (increment_counter) {
-            counter++;
+            counter += 1;
         }
-        out += BLAKE3_OUT_LEN;
+        inputs += 1;
+        num_inputs -= 1;
+        out = &out[BLAKE3_OUT_LEN];
     }
 }
