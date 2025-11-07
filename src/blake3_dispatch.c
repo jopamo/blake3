@@ -87,8 +87,6 @@ static void cpuidex(uint32_t out[4], uint32_t id, uint32_t sid) {
 #endif
 }
 
-#endif
-
 enum cpu_feature {
     SSE2 = 1 << 0,
     SSSE3 = 1 << 1,
@@ -162,6 +160,7 @@ static
 #endif
     }
 }
+#endif
 
 void blake3_compress_in_place(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags) {
 #if defined(IS_X86)

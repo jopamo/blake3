@@ -9,6 +9,10 @@
 
 #include "blake3.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // internal flags
 enum blake3_flags {
     CHUNK_START = 1 << 0,
@@ -26,6 +30,12 @@ enum blake3_flags {
 #define INLINE static __forceinline
 #else
 #define INLINE static inline __attribute__((always_inline))
+#endif
+
+#ifdef __cplusplus
+#define NOEXCEPT noexcept
+#else
+#define NOEXCEPT
 #endif
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
@@ -218,6 +228,8 @@ void blake3_hash_many(const uint8_t* const* inputs,
 
 size_t blake3_simd_degree(void);
 
+BLAKE3_PRIVATE size_t blake3_compress_subtree_wide(const uint8_t* input, size_t input_len, const uint32_t key[8], uint64_t chunk_counter, uint8_t flags, uint8_t* out);
+
 // Declarations for implementation-specific functions.
 void blake3_compress_in_place_portable(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags);
 
@@ -308,6 +320,10 @@ void blake3_hash_many_neon(const uint8_t* const* inputs,
                            uint8_t flags_start,
                            uint8_t flags_end,
                            uint8_t* out);
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* BLAKE3_IMPL_H */
