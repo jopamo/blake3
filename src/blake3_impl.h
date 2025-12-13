@@ -230,6 +230,17 @@ size_t blake3_simd_degree(void);
 
 BLAKE3_PRIVATE size_t blake3_compress_subtree_wide(const uint8_t* input, size_t input_len, const uint32_t key[8], uint64_t chunk_counter, uint8_t flags, uint8_t* out);
 
+/* Internal primitives for parallel hashing */
+BLAKE3_PRIVATE void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags,
+                                     const uint8_t *chunk, size_t chunk_len,
+                                     uint64_t chunk_index, uint8_t out_cv[32]);
+BLAKE3_PRIVATE void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags,
+                                      const uint8_t left_cv[32], const uint8_t right_cv[32],
+                                      uint8_t out_cv[32]);
+BLAKE3_PRIVATE void b3_output_root_impl(const uint32_t key[8], uint8_t flags,
+                                   const uint8_t root_cv[32], uint64_t seek,
+                                   uint8_t *out, size_t out_len);
+
 // Declarations for implementation-specific functions.
 void blake3_compress_in_place_portable(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags);
 
