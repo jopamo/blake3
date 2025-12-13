@@ -579,3 +579,71 @@ void blake3_hasher_reset(blake3_hasher* self) {
     chunk_state_reset(&self->chunk, self->key, 0);
     self->cv_stack_len = 0;
 }
+
+/* Internal primitives for parallel hashing */
+void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags,
+                      const uint8_t *chunk, size_t chunk_len,
+                      uint64_t chunk_index, uint8_t out_cv[32]) {
+    /* For full chunks, use blake3_hash_many for optimal SIMD */
+    if (chunk_len == BLAKE3_CHUNK_LEN) {
+        const uint8_t* inputs[1] = {chunk};
+        blake3_hash_many(inputs, 1, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN,
+                        key, chunk_index, true,
+                        flags, CHUNK_START, CHUNK_END,
+                        out_cv);
+        return;
+    }
+
+    /* Partial chunk: use chunk state */
+    blake3_chunk_state state;
+    chunk_state_init(&state, key, flags);
+    state.chunk_counter = chunk_index;
+    chunk_state_update(&state, chunk, chunk_len);
+    output_t output = chunk_state_output(&state);
+    output_chaining_value(&output, out_cv);
+}
+
+void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags,
+                       const uint8_t left_cv[32], const uint8_t right_cv[32],
+                       uint8_t out_cv[32]) {
+    /* Parent block is concatenation of two child CVs */
+    uint8_t block[BLAKE3_BLOCK_LEN];
+    memcpy(block, left_cv, 32);
+    memcpy(block + 32, right_cv, 32);
+
+    /* Use blake3_hash_many with parent flags */
+    const uint8_t* inputs[1] = {block};
+    blake3_hash_many(inputs, 1, 1,
+                    key, 0, false,
+                    flags, PARENT, 0,
+                    out_cv);
+}
+
+void b3_output_root_impl(const uint32_t key[8], uint8_t flags,
+                    const uint8_t root_cv[32], uint64_t seek,
+                    uint8_t *out, size_t out_len) {
+    /* Convert root CV bytes to words */
+    uint32_t cv_words[8];
+    for (size_t i = 0; i < 8; i++) {
+        cv_words[i] = (uint32_t)root_cv[i * 4 + 0] << 0
+                    | (uint32_t)root_cv[i * 4 + 1] << 8
+                    | (uint32_t)root_cv[i * 4 + 2] << 16
+                    | (uint32_t)root_cv[i * 4 + 3] << 24;
+    }
+
+    /* Output root bytes using compress_xof */
+    size_t offset = 0;
+    uint64_t counter = seek / BLAKE3_BLOCK_LEN;
+
+    while (offset < out_len) {
+        uint8_t block[BLAKE3_BLOCK_LEN];
+        uint8_t block_len = (out_len - offset) < BLAKE3_BLOCK_LEN
+                          ? (uint8_t)(out_len - offset)
+                          : BLAKE3_BLOCK_LEN;
+
+        blake3_compress_xof(cv_words, block, block_len, counter,
+                           flags | ROOT, out + offset);
+        offset += block_len;
+        counter++;
+    }
+}

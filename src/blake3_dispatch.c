@@ -4,6 +4,10 @@
 
 #include "blake3_impl.h"
 
+#if defined(__linux__) && (defined(__arm__) || defined(__aarch64__))
+#include <sys/auxv.h>
+#endif
+
 #if defined(_MSC_VER)
 #include <Windows.h>
 #endif
@@ -95,7 +99,7 @@ enum cpu_feature {
     AVX2 = 1 << 4,
     AVX512F = 1 << 5,
     AVX512VL = 1 << 6,
-    /* ... */
+    NEON = 1 << 7,
     UNDEFINED = 1 << 30
 };
 
@@ -154,8 +158,28 @@ static
         }
         ATOMIC_STORE(g_cpu_features, features);
         return features;
+#elif defined(IS_AARCH64) || defined(__arm__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
+        features = 0;
+#if defined(IS_AARCH64)
+        // NEON is mandatory on AArch64
+        features |= NEON;
+#elif defined(__linux__)
+        // ARM 32-bit Linux: detect via getauxval
+        unsigned long hwcap = getauxval(AT_HWCAP);
+        // HWCAP_NEON is bit 12
+        if (hwcap & (1UL << 12)) {
+            features |= NEON;
+        }
 #else
-        /* How to detect NEON? */
+        // Other OS: assume NEON if compiled with NEON support
+#if BLAKE3_USE_NEON == 1
+        features |= NEON;
+#endif
+#endif
+        ATOMIC_STORE(g_cpu_features, features);
+        return features;
+#else
+        /* Unknown architecture */
         return 0;
 #endif
     }
@@ -274,8 +298,11 @@ void blake3_hash_many(const uint8_t* const* inputs,
 #endif
 
 #if BLAKE3_USE_NEON == 1
-    blake3_hash_many_neon(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
-    return;
+    const enum cpu_feature features = get_cpu_features();
+    if (features & NEON) {
+        blake3_hash_many_neon(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+        return;
+    }
 #endif
 
     blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
@@ -308,7 +335,10 @@ size_t blake3_simd_degree(void) {
 #endif
 #endif
 #if BLAKE3_USE_NEON == 1
-    return 4;
+    const enum cpu_feature features = get_cpu_features();
+    if (features & NEON) {
+        return 4;
+    }
 #endif
     return 1;
 }

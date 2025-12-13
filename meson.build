@@ -20,12 +20,14 @@ project_c_args = []
 project_link_args = []
 simd_args = []
 simd_defines = []
+threads_dep = dependency('threads')
 
 # core blake3 sources
 blake3_sources = [
   'src/blake3.c',
   'src/blake3_dispatch.c',
   'src/blake3_portable.c',
+  'src/blake3_parallel.c',
 ]
 
 # arch-specific implementations are always compiled
@@ -123,7 +125,8 @@ libblake3 = shared_library(
   soversion: '1',
   install: true,
   install_dir: get_option('libdir'),
-  c_args: simd_args + simd_defines
+  c_args: simd_args + simd_defines,
+  dependencies: threads_dep
 )
 
 b3sum_exe = executable(
@@ -135,8 +138,9 @@ b3sum_exe = executable(
   override_options: ['b_lundef=false']
 )
 
-# install public header
+# install public headers
 install_headers('src/blake3.h', subdir: 'b3sum')
+install_headers('src/blake3_parallel.h', subdir: 'b3sum')
 
 pkg = import('pkgconfig')
 pkg.generate(

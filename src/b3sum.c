@@ -60,6 +60,12 @@ b3sum:
 static __thread uint8_t* tls_io_buf = NULL;
 static __thread size_t tls_io_buf_cap = 0;
 
+/* thread local output batching */
+#define OUTPUT_BATCH_BUF_SIZE (64 * 1024)  /* 64KB per thread */
+static __thread char* tls_out_buf = NULL;
+static __thread size_t tls_out_buf_pos = 0;
+static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;  // serialize stdout
+
 /* --- forward declarations --- */
 static int blake3_hash_region_tree(const uint8_t* data, size_t len, uint8_t out_hash[BLAKE3_OUT_LEN]);
 
@@ -117,6 +123,39 @@ static void release_tls_io_buffer(void) {
     tls_io_buf_cap = 0;
 }
 
+// ensure_tls_out_buffer
+// ensures the thread-local output buffer is allocated
+// returns pointer to buffer or NULL on allocation failure
+static char* ensure_tls_out_buffer(void) {
+    if (!tls_out_buf) {
+        tls_out_buf = malloc(OUTPUT_BATCH_BUF_SIZE);
+        if (!tls_out_buf)
+            return NULL;
+        tls_out_buf_pos = 0;
+    }
+    return tls_out_buf;
+}
+
+// flush_tls_out_buffer
+// writes buffered output to stdout under output mutex
+static void flush_tls_out_buffer(void) {
+    if (tls_out_buf && tls_out_buf_pos > 0) {
+        pthread_mutex_lock(&output_mutex);
+        fwrite(tls_out_buf, 1, tls_out_buf_pos, stdout);
+        pthread_mutex_unlock(&output_mutex);
+        tls_out_buf_pos = 0;
+    }
+}
+
+// release_tls_out_buffer
+// frees the thread-local output buffer
+static void release_tls_out_buffer(void) {
+    flush_tls_out_buffer();
+    free(tls_out_buf);
+    tls_out_buf = NULL;
+    tls_out_buf_pos = 0;
+}
+
 /* ──────────────── program options ────────────────
    holds parsed CLI flags and operational modes
    all fields are ints for easy zero-init via memset
@@ -153,7 +192,6 @@ typedef struct file_task {
 
 /* ──────────────── global worker-pool state ──────────────── */
 
-static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;  // serialize stdout
 
 // task queue implemented as a fixed-size ring buffer
 static _Atomic size_t q_head = 0;  // next task to consume
