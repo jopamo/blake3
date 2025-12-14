@@ -1027,6 +1027,7 @@ static void* worker_main(void* arg) {
     }
 
     release_tls_io_buffer();
+    b3p_free_tls_resources();
     return NULL;
 }
 

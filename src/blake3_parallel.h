@@ -66,6 +66,8 @@ BLAKE3_API int b3p_hash_buffer_serial(
   size_t out_len
 );
 
+BLAKE3_API void b3p_free_tls_resources(void);
+
 #ifdef __cplusplus
 }
 #endif
