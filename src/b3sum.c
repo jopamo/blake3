@@ -231,22 +231,19 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
     if (ctx.total_chunks == 0)
         ctx.total_chunks = 1;
 
-    // fast path for small files (≤8 MiB)
-    if (ctx.total_chunks == 1 || ctx.size <= (8u << 20)) {
-        int rc;
-        if (ctx.map)
-            rc = blake3_hash_region_tree(ctx.map, (size_t)ctx.size, out_hash);
-        else {
-            size_t buf_sz = 0;
-            uint8_t* buf = ensure_tls_io_buffer((size_t)ctx.size, &buf_sz);
-            if (!buf || buf_sz < (size_t)ctx.size) {
-                if (ctx.map)
-                    munmap((void*)ctx.map, ctx.map_len);
-                errno = ENOMEM;
-                return -1;
-            }
+    // Use unified b3p path for contiguous buffers (mmap or malloc)
+    const uint8_t *input_buf = NULL;
+    int should_unmap = 0;
 
+    if (ctx.map) {
+        input_buf = ctx.map;
+    } else if (ctx.size <= (8u << 20)) {
+        // Not mmapped, but small enough to read into memory
+        size_t buf_sz = 0;
+        uint8_t* buf = ensure_tls_io_buffer((size_t)ctx.size, &buf_sz);
+        if (buf && buf_sz >= (size_t)ctx.size) {
             size_t have = 0;
+            int read_failed = 0;
             while (have < (size_t)ctx.size) {
                 ssize_t r = read(fd, buf + have, (size_t)ctx.size - have);
                 if (r > 0) {
@@ -255,40 +252,51 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
                 }
                 if (r == 0) {
                     errno = EIO;
+                    read_failed = 1;
                     break;
                 }
                 if (errno != EINTR) {
                     errno = EIO;
+                    read_failed = 1;
                     break;
                 }
             }
-            if (have != (size_t)ctx.size) {
-                if (ctx.map)
-                    munmap((void*)ctx.map, ctx.map_len);
-                return -1;
+            if (!read_failed && have == (size_t)ctx.size) {
+                input_buf = buf;
             }
-            rc = blake3_hash_region_tree(buf, (size_t)ctx.size, out_hash);
         }
-
-        if (ctx.map)
-            munmap((void*)ctx.map, ctx.map_len);
-        return rc;
     }
 
-    // Large file path: use parallel hash engine if mmap succeeded
-    if (ctx.map) {
-        // Debug
-        fprintf(stderr, "DEBUG: Using parallel engine for %ld bytes (mmap)\n", (long)ctx.size);
-        // Configure parallel engine
+    if (input_buf) {
+        // Convert IV to bytes (little-endian)
+        uint8_t iv_bytes[BLAKE3_KEY_LEN];
+        for (size_t i = 0; i < 8; i++) {
+            uint32_t w = IV[i];
+            iv_bytes[i * 4 + 0] = (uint8_t)(w >> 0);
+            iv_bytes[i * 4 + 1] = (uint8_t)(w >> 8);
+            iv_bytes[i * 4 + 2] = (uint8_t)(w >> 16);
+            iv_bytes[i * 4 + 3] = (uint8_t)(w >> 24);
+        }
+
+        // Fast path for small files (<= 1 MiB): use stack-allocated serial hasher
+        if ((size_t)ctx.size <= (1024 * 1024)) {
+             int rc = b3p_hash_buffer_serial(input_buf, (size_t)ctx.size, iv_bytes, 0, out_hash, BLAKE3_OUT_LEN);
+             if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
+             if (rc != 0) {
+                 errno = EIO;
+                 return -1;
+             }
+             return 0;
+        }
+        
+        // Configure parallel engine (serial if small)
         b3p_config_t cfg = b3p_config_default();
         int nthreads = opts->jobs;
         if (nthreads == 0) {
             nthreads = get_nprocs();
         }
         
-        // Clamp threads based on file size to avoid excessive overhead
-        // Each task is B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN bytes.
-        // We shouldn't spawn more threads than tasks.
+        // Clamp threads based on file size
         size_t task_size = (size_t)B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN;
         size_t num_tasks = ((size_t)ctx.size + task_size - 1) / task_size;
         if (num_tasks < 1) num_tasks = 1;
@@ -300,22 +308,16 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
 
         b3p_ctx_t* b3p = b3p_create(&cfg);
         if (!b3p) {
-            munmap((void*)ctx.map, ctx.map_len);
+            if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
             errno = ENOMEM;
             return -1;
         }
-        // Convert IV to bytes (little-endian)
-        uint8_t iv_bytes[BLAKE3_KEY_LEN];
-        for (size_t i = 0; i < 8; i++) {
-            uint32_t w = IV[i];
-            iv_bytes[i * 4 + 0] = (uint8_t)(w >> 0);
-            iv_bytes[i * 4 + 1] = (uint8_t)(w >> 8);
-            iv_bytes[i * 4 + 2] = (uint8_t)(w >> 16);
-            iv_bytes[i * 4 + 3] = (uint8_t)(w >> 24);
-        }
-        int rc = b3p_hash_one_shot(b3p, ctx.map, (size_t)ctx.size, iv_bytes, 0, B3P_METHOD_AUTO, out_hash, BLAKE3_OUT_LEN);
+        
+        int rc = b3p_hash_one_shot(b3p, input_buf, (size_t)ctx.size, iv_bytes, 0, B3P_METHOD_AUTO, out_hash, BLAKE3_OUT_LEN);
         b3p_destroy(b3p);
-        munmap((void*)ctx.map, ctx.map_len);
+        
+        if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
+        
         if (rc != 0) {
             errno = EIO;
             return -1;
@@ -323,8 +325,7 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         return 0;
     }
 
-    // mmap failed or not attempted; fall back to streaming hash
-    // This handles pipes, sockets, and files that cannot be mmapped
+    // Fallback to streaming hash
     int rc = hash_fd_stream_fast(fd, ctx.size, out_hash);
     if (ctx.map)
         munmap((void*)ctx.map, ctx.map_len);
