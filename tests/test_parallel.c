@@ -69,6 +69,76 @@ void test_oneshot(size_t len, int nthreads, size_t out_len) {
     free(actual);
 }
 
+void verify_vector(b3p_ctx_t *b3p, size_t len) {
+    uint8_t *input = malloc(len);
+    if (len > 0) {
+        for (size_t i = 0; i < len; i++) {
+            input[i] = (uint8_t)(i % 251);
+        }
+    }
+
+    uint8_t dummy_key[BLAKE3_KEY_LEN] = {0};
+    uint8_t dummy_flags = KEYED_HASH;
+
+    // 1. Base correctness: one_shot out_len=32
+    {
+        size_t out_len = 32;
+        uint8_t *expected = malloc(out_len);
+        reference_blake3(input, len, dummy_key, 1, dummy_flags, expected, out_len, 0);
+        uint8_t *actual = malloc(out_len);
+        int rc = b3p_hash_one_shot(b3p, input, len, dummy_key, dummy_flags, B3P_METHOD_AUTO, actual, out_len);
+        assert(rc == 0);
+        if (memcmp(expected, actual, out_len) != 0) {
+            printf("FAILED one_shot at len=%zu\n", len);
+            exit(1);
+        }
+        free(expected);
+        free(actual);
+    }
+
+    // 2. Seek correctness: seek=0, out_len=32
+    {
+        size_t out_len = 32;
+        uint8_t *expected = malloc(out_len);
+        reference_blake3(input, len, dummy_key, 1, dummy_flags, expected, out_len, 0);
+        uint8_t *actual = malloc(out_len);
+        int rc = b3p_hash_one_shot_seek(b3p, input, len, dummy_key, dummy_flags, B3P_METHOD_AUTO, 0, actual, out_len);
+        assert(rc == 0);
+        if (memcmp(expected, actual, out_len) != 0) {
+            printf("FAILED one_shot_seek(0) at len=%zu\n", len);
+            exit(1);
+        }
+        free(expected);
+        free(actual);
+    }
+
+    // 3. XOF variations
+    size_t out_lens[] = {1, 2, 31, 32, 33, 63, 64, 65, 1024, 4096};
+    uint64_t seeks[] = {0, 1, 63, 64, 65, 1024, 1ULL << 20};
+
+    for (size_t i = 0; i < sizeof(out_lens)/sizeof(size_t); i++) {
+        for (size_t j = 0; j < sizeof(seeks)/sizeof(uint64_t); j++) {
+            size_t out_len = out_lens[i];
+            uint64_t seek = seeks[j];
+
+            uint8_t *expected = malloc(out_len);
+            reference_blake3(input, len, dummy_key, 1, dummy_flags, expected, out_len, seek);
+
+            uint8_t *actual = malloc(out_len);
+            int rc = b3p_hash_one_shot_seek(b3p, input, len, dummy_key, dummy_flags, B3P_METHOD_AUTO, seek, actual, out_len);
+            assert(rc == 0);
+
+            if (memcmp(expected, actual, out_len) != 0) {
+                printf("FAILED XOF at len=%zu, seek=%lu, out_len=%zu\n", len, seek, out_len);
+                exit(1);
+            }
+            free(expected);
+            free(actual);
+        }
+    }
+
+    free(input);
+}
 
 void test_api_smoke(void) {
     printf("Testing API smoke... ");
@@ -115,9 +185,11 @@ void test_api_smoke(void) {
 uint8_t* get_b3p_hash(b3p_ctx_t *ctx, const uint8_t *input, size_t input_len, int nthreads) {
     b3p_config_t cfg = b3p_config_default();
     cfg.nthreads = nthreads;
+    int created_locally = 0;
     if (!ctx) { // Create context if not provided
         ctx = b3p_create(&cfg);
         assert(ctx != NULL);
+        created_locally = 1;
     }
     
     uint8_t *out = malloc(BLAKE3_OUT_LEN);
@@ -129,7 +201,7 @@ uint8_t* get_b3p_hash(b3p_ctx_t *ctx, const uint8_t *input, size_t input_len, in
     int rc = b3p_hash_one_shot(ctx, input, input_len, dummy_key, dummy_flags, B3P_METHOD_AUTO, out, BLAKE3_OUT_LEN);
     assert(rc == 0);
     
-    if (!ctx) { // Destroy context if created within this function
+    if (created_locally) { // Destroy context if created within this function
         b3p_destroy(ctx);
     }
     return out;
@@ -329,9 +401,95 @@ void test_empty_input_hash_difference(void) {
     printf("OK\n");
 }
 
+void add_len(size_t **lens, size_t *count, size_t *cap, size_t l) {
+    if (*count == *cap) {
+        *cap = *cap ? *cap * 2 : 256;
+        *lens = realloc(*lens, *cap * sizeof(size_t));
+    }
+    (*lens)[(*count)++] = l;
+}
+
+void test_edge_cases(void) {
+    printf("Testing edge cases...\n");
+    size_t *lens = NULL;
+    size_t count = 0;
+    size_t cap = 0;
+
+    // 1. Basic small cases
+    add_len(&lens, &count, &cap, 0);
+    add_len(&lens, &count, &cap, 1);
+
+    // 2. Block boundaries
+    add_len(&lens, &count, &cap, 63);
+    add_len(&lens, &count, &cap, 64);
+    add_len(&lens, &count, &cap, 65);
+
+    // 3. Chunk boundaries
+    add_len(&lens, &count, &cap, 1023);
+    add_len(&lens, &count, &cap, 1024);
+    add_len(&lens, &count, &cap, 1025);
+
+    // 4. Two chunks
+    add_len(&lens, &count, &cap, 2047);
+    add_len(&lens, &count, &cap, 2048);
+    add_len(&lens, &count, &cap, 2049);
+
+    // 5. Multiples of chunks
+    size_t n_values[] = {2, 3, 31, 32, 33, 63, 64, 65};
+    for (size_t i = 0; i < sizeof(n_values)/sizeof(size_t); i++) {
+        size_t n = n_values[i];
+        size_t base = n * 1024;
+        add_len(&lens, &count, &cap, base - 1);
+        add_len(&lens, &count, &cap, base);
+        add_len(&lens, &count, &cap, base + 1);
+    }
+
+    // 6. Batch step boundaries (Method A)
+    size_t simd_degree = blake3_simd_degree();
+    if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
+    size_t batch_step_chunks = simd_degree * 64;
+    size_t batch_step_bytes = batch_step_chunks * 1024;
+    
+    add_len(&lens, &count, &cap, batch_step_bytes - 1);
+    add_len(&lens, &count, &cap, batch_step_bytes);
+    add_len(&lens, &count, &cap, batch_step_bytes + 1);
+    
+    // Also test around num_chunks = multiple of batch_step.
+    // Let's test 1x and 2x batch_step
+    add_len(&lens, &count, &cap, (2 * batch_step_bytes) - 1);
+    add_len(&lens, &count, &cap, (2 * batch_step_bytes));
+    add_len(&lens, &count, &cap, (2 * batch_step_bytes) + 1);
+
+    // 7. Subtree boundaries (Method B)
+    size_t subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS;
+    size_t subtree_bytes = subtree_chunks * 1024;
+
+    add_len(&lens, &count, &cap, subtree_bytes - 1);
+    add_len(&lens, &count, &cap, subtree_bytes);
+    add_len(&lens, &count, &cap, subtree_bytes + 1);
+
+    add_len(&lens, &count, &cap, (2 * subtree_bytes) - 1);
+    add_len(&lens, &count, &cap, (2 * subtree_bytes));
+    add_len(&lens, &count, &cap, (2 * subtree_bytes) + 1);
+
+    b3p_config_t cfg = b3p_config_default();
+    cfg.nthreads = 4;
+    b3p_ctx_t *b3p = b3p_create(&cfg);
+    assert(b3p != NULL);
+
+    for (size_t i = 0; i < count; i++) {
+        verify_vector(b3p, lens[i]);
+    }
+    
+    b3p_destroy(b3p);
+    free(lens);
+    printf("Edge cases OK\n");
+}
+
 int main(void) {
     srand(0); // Seed random number generator for reproducible tests
     test_api_smoke();
+    test_edge_cases();
     test_determinism_multiple_runs();
     test_determinism_create_destroy();
     test_determinism_thread_counts();
@@ -358,5 +516,6 @@ int main(void) {
     test_oneshot(10 * 1024 * 1024, 4, BLAKE3_OUT_LEN);
     test_oneshot(100 * 1024 * 1024, 8, BLAKE3_OUT_LEN);
 
+    b3p_free_tls_resources();
     return 0;
 }

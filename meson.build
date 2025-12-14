@@ -160,6 +160,38 @@ test_parallel = executable(
 )
 test('parallel_hashing', test_parallel)
 
+test_flags_keys = executable(
+  'test_flags_keys',
+  ['tests/test_flags_keys.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('flags_keys', test_flags_keys)
+
+test_parallel_extended = executable(
+  'test_parallel_extended',
+  ['tests/test_parallel_extended.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('parallel_extended', test_parallel_extended)
+
+test_regressions = executable(
+  'test_regressions',
+  ['tests/test_regressions.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('regressions', test_regressions)
+
+test_fault_injection = executable(
+  'test_fault_injection',
+  ['tests/test_fault_injection.c'],
+  c_args: simd_args + simd_defines,
+  dependencies: threads_dep
+)
+test('fault_injection', test_fault_injection)
+
 test_vectors = executable(
   'test_vectors',
   ['tests/test_vectors.c'],
