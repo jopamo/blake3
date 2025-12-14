@@ -134,12 +134,20 @@ b3p_ctx_t *b3p_create(const b3p_config_t *cfg) {
   if (!ctx) return NULL;
 
   ctx->cfg = *cfg;
-  // Initialize worker pool
   size_t nthreads = cfg->nthreads;
-  size_t qcap = 256; // default queue capacity
-  if (b3p_pool_init(&ctx->pool, nthreads, qcap) != 0) {
-    free(ctx);
-    return NULL;
+  if (nthreads == 0) {
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+    nthreads = (size_t)ncpu;
+  }
+
+  if (nthreads > 1) {
+      if (b3p_pool_init(&ctx->pool, nthreads, 256) != 0) {
+        free(ctx);
+        return NULL;
+      }
+  } else {
+      ctx->pool.nthreads = 0;
   }
 
   ctx->scratch_cvs = NULL;
@@ -187,6 +195,7 @@ int b3p_hash_one_shot_seek(
   ctx->input = input;
   ctx->input_len = input_len;
   ctx->num_chunks = (input_len + (size_t)BLAKE3_CHUNK_LEN - 1) / (size_t)BLAKE3_CHUNK_LEN;
+  if (ctx->num_chunks == 0) ctx->num_chunks = 1;
 
   // Convert key bytes to words
   for (size_t i = 0; i < 8; i++) {
@@ -536,9 +545,11 @@ static void b3p_hash_range_to_root(
   size_t chunk_start,
   size_t chunk_end,
   b3_cv_bytes_t *tmp,
-  b3_cv_bytes_t *out_root
+  b3_cv_bytes_t *out_root,
+  int is_root
 ) {
   size_t n = chunk_end - chunk_start;
+  // fprintf(stderr, "DEBUG: b3p_hash_range_to_root start=%zu end=%zu n=%zu\n", chunk_start, chunk_end, n);
 #if DEBUG_PARALLEL
   fprintf(stderr, "[parallel] hash_range_to_root: chunk_start=%zu chunk_end=%zu n=%zu\n", chunk_start, chunk_end, n);
 #endif
@@ -566,8 +577,15 @@ static void b3p_hash_range_to_root(
           for (size_t j = 0; j < full_count; j++) {
               inputs[j] = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
           }
+          uint8_t flags_end = CHUNK_END;
+          // If this batch covers the single root chunk (n=1 implies we are processing the only chunk in this range)
+          // If is_root is true, and n=1, then this chunk is the root of the tree.
+          if (is_root && n == 1 && full_count == 1) {
+             flags_end |= ROOT;
+          }
+
           blake3_hash_many(inputs, full_count, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN,
-                           ctx->kf.key, (uint64_t)(chunk_start + i), true, ctx->kf.flags, CHUNK_START, CHUNK_END,
+                           ctx->kf.key, (uint64_t)(chunk_start + i), true, ctx->kf.flags, CHUNK_START, flags_end,
                            tmp[i].bytes);
       }
 
@@ -579,13 +597,15 @@ static void b3p_hash_range_to_root(
           size_t off = chunk_i * (size_t)BLAKE3_CHUNK_LEN;
           size_t remain = ctx->input_len - off;
           size_t clen = remain < (size_t)BLAKE3_CHUNK_LEN ? remain : (size_t)BLAKE3_CHUNK_LEN;
-          b3_hash_chunk_cv_impl(ctx->kf.key, ctx->kf.flags, partial_chunk_ptr, clen, (uint64_t)chunk_i, false, tmp[i + j].bytes);
+          
+          bool chunk_is_root = (is_root && n == 1);
+          b3_hash_chunk_cv_impl(ctx->kf.key, ctx->kf.flags, partial_chunk_ptr, clen, (uint64_t)chunk_i, chunk_is_root, tmp[i + j].bytes);
       }
       i += count;
       input_ptr += count * (size_t)BLAKE3_CHUNK_LEN;
   }
 
-  b3p_reduce_in_place(ctx, tmp, n, out_root, 0);
+  b3p_reduce_in_place(ctx, tmp, n, out_root, is_root);
 }
 
 static void b3p_task_hash_subtrees(void *arg) {
@@ -616,7 +636,8 @@ static void b3p_task_hash_subtrees(void *arg) {
     fprintf(stderr, "[parallel] chunk_start=%zu chunk_end=%zu\n", chunk_start, chunk_end);
 #endif
     b3_cv_bytes_t root = {0};
-    b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root);
+    int is_root = (job->num_subtrees == 1);
+    b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root);
     job->out_subtree_cvs[s] = root;
   }
 }
@@ -729,6 +750,36 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_roo
   return 0;
 }
 
+static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
+  size_t subtree_chunks = ctx->cfg.subtree_chunks ? ctx->cfg.subtree_chunks : B3P_DEFAULT_SUBTREE_CHUNKS;
+  size_t num_subtrees = (ctx->num_chunks + subtree_chunks - 1) / subtree_chunks;
+
+  if (b3p_ensure_scratch(ctx, num_subtrees) != 0)
+    return -1;
+
+  size_t max_tmp = subtree_chunks;
+  b3_cv_bytes_t *tmp = (b3_cv_bytes_t*)malloc(max_tmp * sizeof(b3_cv_bytes_t));
+  if (!tmp) return -1;
+
+  int is_root = (num_subtrees == 1);
+
+  for (size_t s = 0; s < num_subtrees; s++) {
+    size_t chunk_start = s * subtree_chunks;
+    size_t chunk_end = chunk_start + subtree_chunks;
+    if (chunk_end > ctx->num_chunks)
+      chunk_end = ctx->num_chunks;
+
+    b3_cv_bytes_t root = {0};
+    b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root);
+    ctx->scratch_cvs[s] = root;
+  }
+  
+  free(tmp);
+
+  b3p_reduce_in_place(ctx, ctx->scratch_cvs, num_subtrees, out_root, 1);
+  return 0;
+}
+
 /* ============================================================================
  * Root computation
  * ===========================================================================*/
@@ -739,6 +790,11 @@ static int b3p_compute_root(
   b3_cv_bytes_t *out_root,
   uint64_t *out_ns
 ) {
+  if (ctx->pool.nthreads == 0) {
+      *out_ns = 0;
+      return b3p_run_serial(ctx, out_root);
+  }
+
   int rc = 0;
   if (method == B3P_METHOD_A_CHUNKS)
     rc = b3p_run_method_a_chunks(ctx, out_root);
@@ -749,4 +805,61 @@ static int b3p_compute_root(
 
   *out_ns = 0;
   return rc;
+}
+
+int b3p_hash_buffer_serial(
+  const uint8_t *input,
+  size_t input_len,
+  const uint8_t key[BLAKE3_KEY_LEN],
+  uint8_t flags,
+  uint8_t *out,
+  size_t out_len
+) {
+  if (!input || !out) return -1;
+  if (out_len == 0) return 0;
+
+  struct b3p_ctx ctx = {0};
+  ctx.input = input;
+  ctx.input_len = input_len;
+  ctx.num_chunks = (input_len + (size_t)BLAKE3_CHUNK_LEN - 1) / (size_t)BLAKE3_CHUNK_LEN;
+  if (ctx.num_chunks == 0) ctx.num_chunks = 1;
+
+  for (size_t i = 0; i < 8; i++) {
+    uint32_t w = 0;
+    w |= (uint32_t)key[i * 4 + 0] << 0;
+    w |= (uint32_t)key[i * 4 + 1] << 8;
+    w |= (uint32_t)key[i * 4 + 2] << 16;
+    w |= (uint32_t)key[i * 4 + 3] << 24;
+    ctx.kf.key[i] = w;
+  }
+  ctx.kf.flags = flags;
+
+  // For small inputs, allocate on stack to avoid malloc overhead
+  // 1MB input -> 1024 chunks -> 32KB CVs. Safe.
+  // 4MB input -> 4096 chunks -> 128KB CVs. Safe.
+  // Above that, use malloc.
+  size_t max_stack_chunks = 4096; 
+  size_t needed_cvs = ctx.num_chunks;
+  
+  b3_cv_bytes_t *tmp;
+  b3_cv_bytes_t *heap_tmp = NULL;
+
+  if (needed_cvs <= max_stack_chunks) {
+      tmp = (b3_cv_bytes_t*)alloca(needed_cvs * sizeof(b3_cv_bytes_t));
+  } else {
+      heap_tmp = (b3_cv_bytes_t*)malloc(needed_cvs * sizeof(b3_cv_bytes_t));
+      if (!heap_tmp) return -1;
+      tmp = heap_tmp;
+  }
+
+  b3_cv_bytes_t root = {0};
+  // We process the entire buffer as one range. Since this function is for serial execution
+  // of contiguous buffers, we treat the whole input as one "subtree" (or rather the whole tree).
+  // b3p_hash_range_to_root will handle reduction and ROOT flag (since is_root=1).
+  b3p_hash_range_to_root(&ctx, 0, ctx.num_chunks, tmp, &root, 1);
+
+  if (heap_tmp) free(heap_tmp);
+
+  b3_output_root_impl(ctx.kf.key, ctx.kf.flags, root.bytes, 0, out, out_len);
+  return 0;
 }

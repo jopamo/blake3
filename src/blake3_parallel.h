@@ -57,6 +57,15 @@ BLAKE3_API int b3p_hash_one_shot_seek(
   size_t out_len
 );
 
+BLAKE3_API int b3p_hash_buffer_serial(
+  const uint8_t *input,
+  size_t input_len,
+  const uint8_t key[BLAKE3_KEY_LEN],
+  uint8_t flags,
+  uint8_t *out,
+  size_t out_len
+);
+
 #ifdef __cplusplus
 }
 #endif

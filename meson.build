@@ -152,6 +152,14 @@ pkg.generate(
   install_dir: join_paths(get_option('libdir'), 'pkgconfig')
 )
 
+test_parallel = executable(
+  'test_parallel',
+  ['tests/test_parallel.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('parallel_hashing', test_parallel)
+
 summary({
   'SIMD compile args': simd_args,
   'BLAKE3 source files': blake3_sources,
