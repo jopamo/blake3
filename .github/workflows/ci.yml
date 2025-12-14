@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-fedora-sanitizers:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang \
+            llvm \
+            meson \
+            ninja-build \
+            git \
+            libasan \
+            libubsan
+
+      - name: Configure build (Clang + ASan/UBSan)
+        run: |
+          CC=clang meson setup build-asan \
+            -Ddebug_sanitize=true \
+            -Dbuildtype=debugoptimized \
+            -Dwerror=true
+
+      - name: Build
+        run: ninja -C build-asan
+
+      - name: Run tests
+        run: ninja -C build-asan test
