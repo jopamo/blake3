@@ -36,4 +36,9 @@ jobs:
         run: ninja -C build-asan
 
       - name: Run tests
-        run: ninja -C build-asan test
+        run: |
+          # Find where libclang_rt.asan.so is located
+          ASAN_LIB_PATH=$(dirname $(find /usr -name libclang_rt.asan.so | head -n 1))
+          echo "Found ASan lib at: $ASAN_LIB_PATH"
+          export LD_LIBRARY_PATH="$ASAN_LIB_PATH:$LD_LIBRARY_PATH"
+          ninja -C build-asan test
