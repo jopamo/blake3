@@ -250,27 +250,6 @@ The project uses Chromium-style C formatting with 4-space indentation. A `.clang
 clang-format -i src/filename.c
 ```
 
-### Commit Messages
-
-Follow the existing commit history style:
-- Concise summary line (50-72 characters)
-- Detailed description if needed
-- Reference issues or PRs when applicable
-
-### Pull Requests
-
-1. **Branch**: Create a feature branch from `master`
-2. **Testing**: Ensure all tests pass
-3. **Benchmarks**: Check for performance regressions
-4. **Documentation**: Update relevant documentation
-
-### Areas for Contribution
-
-1. **New platforms**: Support for additional architectures (RISC-V, POWER, etc.)
-2. **Performance optimizations**: Improved SIMD implementations, better scheduling
-3. **Features**: Additional command-line options, integration with other tools
-4. **Testing**: Expanded test coverage, CI integration
-
 ## Additional Resources
 
 - [Official BLAKE3 Specification](https://github.com/BLAKE3-team/BLAKE3-specs)
