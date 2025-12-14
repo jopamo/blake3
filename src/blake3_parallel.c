@@ -1,8 +1,9 @@
 #define _GNU_SOURCE
+
 #include "blake3_parallel.h"
 #include "blake3_impl.h"
 
-/* Types previously defined in blake3_internal.h */
+/* Keep these local to avoid pulling extra headers into the hot path */
 typedef struct {
   uint8_t bytes[32];
 } b3_cv_bytes_t;
@@ -11,6 +12,7 @@ typedef struct {
   uint32_t key[8];
   uint8_t flags;
 } b3_keyed_flags_t;
+
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -20,9 +22,12 @@ typedef struct {
 #include <unistd.h>
 #include <alloca.h>
 #include <stdio.h>
+
 #define DEBUG_PARALLEL 0
 
-// Thread-local scratch space for CVs (avoiding per-task malloc/alloca)
+/* Thread-local CV scratch
+   Avoids per-task malloc and avoids alloca in deep or repeated calls
+   Buffer is grown amortized and reused for the lifetime of the worker thread */
 static __thread b3_cv_bytes_t *g_tls_cv_buf = NULL;
 static __thread size_t g_tls_cv_cap = 0;
 
@@ -30,20 +35,19 @@ static b3_cv_bytes_t* ensure_tls_cv_buffer(size_t count) {
     if (count > g_tls_cv_cap) {
         size_t new_cap = g_tls_cv_cap ? g_tls_cv_cap : 1024;
         while (new_cap < count) new_cap *= 2;
-        
+
         b3_cv_bytes_t *new_buf = realloc(g_tls_cv_buf, new_cap * sizeof(b3_cv_bytes_t));
         if (!new_buf) return NULL;
-        
+
         g_tls_cv_buf = new_buf;
         g_tls_cv_cap = new_cap;
     }
     return g_tls_cv_buf;
 }
 
-/* ============================================================================
- * Worker pool data structures
- * ===========================================================================*/
-
+/* Worker pool structures
+   Simple bounded queue plus taskgroup counter
+   Intended to keep scheduling overhead negligible relative to hashing work */
 typedef void (*b3p_task_fn)(void *arg);
 
 typedef struct {
@@ -76,14 +80,9 @@ typedef struct {
   b3p_taskq_t q;
 } b3p_pool_t;
 
-
-
-
-
-/* ============================================================================
- * Context object tying it all together
- * ===========================================================================*/
-
+/* Parallel hashing context
+   Stores the keyed flags and the current input range for one-shot hashing
+   Scratch CV storage is kept on the context for amortized reuse across calls */
 typedef b3_keyed_flags_t b3p_keyed_flags_t;
 
 struct b3p_ctx {
@@ -100,10 +99,7 @@ struct b3p_ctx {
   b3p_config_t cfg;
 };
 
-/* ============================================================================
- * Forward declarations of internal functions
- * ===========================================================================*/
-
+/* Internal forward declarations */
 static int b3p_pool_init(b3p_pool_t *p, size_t nthreads, size_t qcap);
 static void b3p_pool_destroy(b3p_pool_t *p);
 static void b3p_taskgroup_init(b3p_taskgroup_t *g);
@@ -111,7 +107,6 @@ static void b3p_taskgroup_destroy(b3p_taskgroup_t *g);
 static int b3p_pool_submit(b3p_pool_t *p, b3p_taskgroup_t *g, b3p_task_fn fn, void *arg);
 static void b3p_taskgroup_wait(b3p_taskgroup_t *g);
 static void *b3p_worker_main(void *arg);
-
 
 static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs);
 
@@ -128,9 +123,7 @@ static int b3p_compute_root(
   uint64_t *out_ns
 );
 
-/* ============================================================================
- * Public API implementation
- * ===========================================================================*/
+/* Public API */
 
 b3p_config_t b3p_config_default(void) {
   b3p_config_t c = {0};
@@ -159,8 +152,12 @@ b3p_ctx_t *b3p_create(const b3p_config_t *cfg) {
     nthreads = (size_t)ncpu;
   }
 
+  /* If only one thread is requested, skip pool creation entirely
+     This avoids mutex/cond overhead and keeps serial one-shot fast */
   if (nthreads > 1) {
-      if (b3p_pool_init(&ctx->pool, nthreads, nthreads * 2 < 2 ? 2 : nthreads * 2) != 0) {
+      size_t qcap = nthreads * 2;
+      if (qcap < 2) qcap = 2;
+      if (b3p_pool_init(&ctx->pool, nthreads, qcap) != 0) {
         free(ctx);
         return NULL;
       }
@@ -215,7 +212,8 @@ int b3p_hash_one_shot_seek(
   ctx->num_chunks = (input_len + (size_t)BLAKE3_CHUNK_LEN - 1) / (size_t)BLAKE3_CHUNK_LEN;
   if (ctx->num_chunks == 0) ctx->num_chunks = 1;
 
-  // Convert key bytes to words
+  /* Convert key bytes to little-endian words once per call
+     The hashing core consumes key as u32 words */
   for (size_t i = 0; i < 8; i++) {
     uint32_t w = 0;
     w |= (uint32_t)key[i * 4 + 0] << 0;
@@ -225,16 +223,9 @@ int b3p_hash_one_shot_seek(
     ctx->kf.key[i] = w;
   }
   ctx->kf.flags = flags;
+
 #if DEBUG_PARALLEL
-  fprintf(stderr, "[parallel] key bytes: ");
-  for (int i = 0; i < BLAKE3_KEY_LEN; i++) {
-    fprintf(stderr, "%02x", key[i]);
-  }
-  fprintf(stderr, "\n[parallel] key words: ");
-  for (int i = 0; i < 8; i++) {
-    fprintf(stderr, "%08x ", ctx->kf.key[i]);
-  }
-  fprintf(stderr, "\n[parallel] flags: %02x\n", flags);
+  fprintf(stderr, "[parallel] flags: %02x input_len=%zu num_chunks=%zu\n", flags, input_len, ctx->num_chunks);
 #endif
 
   b3p_method_t chosen = method;
@@ -248,14 +239,12 @@ int b3p_hash_one_shot_seek(
   if (rc != 0)
     return rc;
 
-
+  /* Root output uses the implementation primitive directly to avoid wrappers */
   b3_output_root_impl(ctx->kf.key, ctx->kf.flags, root.bytes, seek, out, out_len);
   return 0;
 }
 
-/* ============================================================================
- * Worker pool implementation
- * ===========================================================================*/
+/* Worker pool implementation */
 
 static int b3p_pool_init(b3p_pool_t *p, size_t nthreads, size_t qcap) {
   if (qcap == 0) {
@@ -296,7 +285,6 @@ static int b3p_pool_init(b3p_pool_t *p, size_t nthreads, size_t qcap) {
 
   for (size_t i = 0; i < nthreads; i++) {
     if (pthread_create(&p->threads[i], NULL, b3p_worker_main, p) != 0) {
-      /* Failed to create thread; stop already created threads */
       p->nthreads = i;
       p->q.stop = 1;
       pthread_cond_broadcast(&p->q.cv_pop);
@@ -346,6 +334,8 @@ static void b3p_taskgroup_destroy(b3p_taskgroup_t *g) {
   pthread_cond_destroy(&g->cv);
 }
 
+/* Submitting tasks increments the pending counter
+   Workers decrement it and signal completion when it reaches zero */
 static int b3p_pool_submit(b3p_pool_t *p, b3p_taskgroup_t *g, b3p_task_fn fn, void *arg) {
   pthread_mutex_lock(&p->q.mu);
   while (p->q.count == p->q.cap && !p->q.stop) {
@@ -379,6 +369,8 @@ static void b3p_taskgroup_wait(b3p_taskgroup_t *g) {
   pthread_mutex_unlock(&g->mu);
 }
 
+/* Worker thread main loop
+   Pops tasks, runs them, and updates the taskgroup pending counter */
 static void *b3p_worker_main(void *arg) {
   b3p_pool_t *p = (b3p_pool_t *)arg;
 
@@ -412,6 +404,8 @@ static void *b3p_worker_main(void *arg) {
     }
   }
 
+  /* Worker exit cleanup
+     TLS scratch is owned by the thread, so it can be freed here */
   if (g_tls_cv_buf) {
       free(g_tls_cv_buf);
       g_tls_cv_buf = NULL;
@@ -421,17 +415,7 @@ static void *b3p_worker_main(void *arg) {
   return NULL;
 }
 
-
-
-
-
-
-
-
-
-/* ============================================================================
- * Scratch management
- * ===========================================================================*/
+/* Scratch management */
 
 static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs) {
   if (want_cvs <= ctx->scratch_cvs_cap)
@@ -450,10 +434,9 @@ static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs) {
   return 0;
 }
 
-/* ============================================================================
- * Selection logic
- * ===========================================================================*/
-
+/* Selection logic
+   Heuristic chooses between chunk-level and subtree-level parallelism
+   Prefer subtrees only when there is enough work per thread */
 static inline size_t b3_min_sz(size_t a, size_t b) { return a < b ? a : b; }
 
 static inline size_t b3_full_chunks(size_t input_len) {
@@ -477,10 +460,7 @@ static b3p_method_t b3p_pick_heuristic(struct b3p_ctx *ctx) {
   return B3P_METHOD_A_CHUNKS;
 }
 
-
-/* ============================================================================
- * Method implementations
- * ===========================================================================*/
+/* Method implementations */
 
 static inline void b3p_hash_range_to_root(
   struct b3p_ctx *ctx,
@@ -507,12 +487,15 @@ typedef struct {
   b3_cv_bytes_t *out_subtree_cvs;
 } b3p_subtrees_job_t;
 
+/* Chunk mode
+   Each worker grabs a batch of chunks, hashes them, reduces to a batch root CV
+   This amortizes scheduling overhead and reduces the size of the final reduction */
 static void b3p_task_hash_chunks(void *arg) {
   b3p_chunks_job_t *job = arg;
   struct b3p_ctx *ctx = job->ctx;
-  
-  // Local buffer for batch reduction
-  // Max batch step is MAX_SIMD_DEGREE * 64 = 16 * 64 = 1024
+
+  /* Local buffer sized for the maximum batch
+     Keeps per-batch CVs on the stack, avoiding heap traffic */
   b3_cv_bytes_t local_buf[1024];
 
   for (;;) {
@@ -524,14 +507,18 @@ static void b3p_task_hash_chunks(void *arg) {
     if (batch_limit > job->end_chunk) batch_limit = job->end_chunk;
 
     size_t batch_idx = batch_start / job->batch_step;
-    
-    // Check if this batch covers the entire input (only possible if 1 batch)
+
+    /* This batch is the entire input only in the single-batch case
+       Passing is_root through ensures correct ROOT handling for tiny inputs */
     int is_root = (batch_start == 0 && batch_limit == ctx->num_chunks);
-    
+
     b3p_hash_range_to_root(ctx, batch_start, batch_limit, local_buf, &job->out_cvs[batch_idx], is_root);
   }
 }
 
+/* Hash and reduce a contiguous chunk range
+   Hashes full chunks via blake3_hash_many for batching, then handles one partial tail if present
+   Reduction is done with the stack merge to preserve correct tree shape for non-powers-of-two */
 static inline void b3p_hash_range_to_root(
   struct b3p_ctx *ctx,
   size_t chunk_start,
@@ -541,7 +528,7 @@ static inline void b3p_hash_range_to_root(
   int is_root
 ) {
   size_t n = chunk_end - chunk_start;
-  // fprintf(stderr, "DEBUG: b3p_hash_range_to_root start=%zu end=%zu n=%zu\n", chunk_start, chunk_end, n);
+
 #if DEBUG_PARALLEL
   fprintf(stderr, "[parallel] hash_range_to_root: chunk_start=%zu chunk_end=%zu n=%zu\n", chunk_start, chunk_end, n);
 #endif
@@ -556,6 +543,8 @@ static inline void b3p_hash_range_to_root(
       size_t count = simd_degree;
       if (i + count > n) count = n - i;
 
+      /* Determine how many of the next 'count' chunks are full
+         If the very last chunk is partial, hash it with the chunk primitive */
       size_t full_count = count;
       if (chunk_start + i + count == ctx->num_chunks) {
         size_t off = (ctx->num_chunks - 1) * (size_t)BLAKE3_CHUNK_LEN;
@@ -569,15 +558,15 @@ static inline void b3p_hash_range_to_root(
           for (size_t j = 0; j < full_count; j++) {
               inputs[j] = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
           }
+
           uint8_t flags_end = CHUNK_END;
-          // If this batch covers the single root chunk (n=1 implies we are processing the only chunk in this range)
-          // If is_root is true, and n=1, then this chunk is the root of the tree.
           if (is_root && n == 1 && full_count == 1) {
              flags_end |= ROOT;
           }
 
           blake3_hash_many(inputs, full_count, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN,
-                           ctx->kf.key, (uint64_t)(chunk_start + i), true, ctx->kf.flags, CHUNK_START, flags_end,
+                           ctx->kf.key, (uint64_t)(chunk_start + i), true,
+                           ctx->kf.flags, CHUNK_START, flags_end,
                            tmp[i].bytes);
       }
 
@@ -585,14 +574,18 @@ static inline void b3p_hash_range_to_root(
           size_t j = full_count;
           size_t chunk_i = chunk_start + i + j;
           const uint8_t *partial_chunk_ptr = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
-          
+
           size_t off = chunk_i * (size_t)BLAKE3_CHUNK_LEN;
           size_t remain = ctx->input_len - off;
           size_t clen = remain < (size_t)BLAKE3_CHUNK_LEN ? remain : (size_t)BLAKE3_CHUNK_LEN;
-          
-          bool chunk_is_root = (is_root && n == 1);
+
+          int chunk_is_root = (is_root && n == 1);
+
+          /* Partial chunk uses the chunk CV primitive
+             This avoids padding logic in the hash_many fast path */
           b3_hash_chunk_cv_impl(ctx->kf.key, ctx->kf.flags, partial_chunk_ptr, clen, (uint64_t)chunk_i, chunk_is_root, tmp[i + j].bytes);
       }
+
       i += count;
       input_ptr += count * (size_t)BLAKE3_CHUNK_LEN;
   }
@@ -600,34 +593,28 @@ static inline void b3p_hash_range_to_root(
   b3p_reduce_stack(ctx, tmp, n, 1, out_root, is_root);
 }
 
+/* Subtree mode
+   Each worker hashes an entire subtree range and reduces it to a subtree root CV
+   The final merge combines subtree roots using the stack merge */
 static void b3p_task_hash_subtrees(void *arg) {
-#if DEBUG_PARALLEL
-  fprintf(stderr, "[parallel] task_hash_subtrees start\n");
-#endif
   b3p_subtrees_job_t *job = arg;
   struct b3p_ctx *ctx = job->ctx;
 
   size_t max_tmp = job->subtree_chunks;
-#if DEBUG_PARALLEL
-  fprintf(stderr, "[parallel] max_tmp=%zu\n", max_tmp);
-#endif
+
   b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(max_tmp);
-  if (!tmp) return; // Should handle error better? but void return
+  if (!tmp) return;
 
   for (;;) {
     size_t s = atomic_fetch_add_explicit(&job->next_subtree, 1, memory_order_relaxed);
     if (s >= job->num_subtrees)
       break;
-#if DEBUG_PARALLEL
-    fprintf(stderr, "[parallel] subtree s=%zu\n", s);
-#endif
+
     size_t chunk_start = s * job->subtree_chunks;
     size_t chunk_end = chunk_start + job->subtree_chunks;
     if (chunk_end > ctx->num_chunks)
       chunk_end = ctx->num_chunks;
-#if DEBUG_PARALLEL
-    fprintf(stderr, "[parallel] chunk_start=%zu chunk_end=%zu\n", chunk_start, chunk_end);
-#endif
+
     b3_cv_bytes_t root = {0};
     int is_root = (job->num_subtrees == 1);
     b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root);
@@ -635,19 +622,35 @@ static void b3p_task_hash_subtrees(void *arg) {
   }
 }
 
-static inline void b3p_merge_nodes(const uint32_t key[8], uint8_t base_flags, 
-                                   const b3_cv_bytes_t *left, const b3_cv_bytes_t *restrict right, 
-                                   b3_cv_bytes_t *out, int is_root) {
-    uint8_t flags = base_flags | PARENT;
+/* Merge two child CVs into a parent CV
+   ROOT is applied only at the final merge step */
+static inline void b3p_merge_nodes(
+    const uint32_t key[8],
+    uint8_t base_flags,
+    const b3_cv_bytes_t *left,
+    const b3_cv_bytes_t *restrict right,
+    b3_cv_bytes_t *out,
+    int is_root
+) {
+    uint8_t flags = (uint8_t)(base_flags | PARENT);
     if (is_root) flags |= ROOT;
     b3_hash_parent_cv_impl(key, flags, left->bytes, right->bytes, out->bytes);
 }
 
-static void b3p_reduce_stack(struct b3p_ctx *ctx, b3_cv_bytes_t *restrict cvs, size_t n, size_t subtree_chunks, b3_cv_bytes_t *restrict out_root, int is_final) {
+/* Stack reduction for CVs
+   Implements the BLAKE3 lazy-merge shape via counts
+   This preserves correctness for non-power-of-two counts and avoids extra passes */
+static void b3p_reduce_stack(
+    struct b3p_ctx *ctx,
+    b3_cv_bytes_t *restrict cvs,
+    size_t n,
+    size_t subtree_chunks,
+    b3_cv_bytes_t *restrict out_root,
+    int is_final
+) {
   size_t stack_counts[64];
   size_t top = 0;
 
-  // Pre-calculate total count to identify when we've formed the root
   size_t total_count = 0;
   for (size_t i = 0; i < n; i++) {
      size_t count = subtree_chunks;
@@ -664,60 +667,60 @@ static void b3p_reduce_stack(struct b3p_ctx *ctx, b3_cv_bytes_t *restrict cvs, s
          size_t remainder = ctx->num_chunks % subtree_chunks;
          if (remainder != 0) count = remainder;
     }
-    
-    // Push: In-place, so we just set the count. The CV is already at cvs[i].
-    // If top != i, we need to move it.
-    // However, since we are consuming cvs[i] and potentially writing to cvs[top],
-    // and top <= i always, we can copy.
+
     if (top != i) {
         cvs[top] = cvs[i];
     }
     stack_counts[top] = count;
     top++;
 
-    // Merge
     while (top >= 2) {
       if (stack_counts[top-1] == stack_counts[top-2]) {
          size_t right_idx = top - 1;
          size_t left_idx = top - 2;
-         
+
          size_t new_count = stack_counts[left_idx] + stack_counts[right_idx];
          int is_root = (is_final && new_count == total_count);
-         
-         b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, 
-                         &cvs[left_idx], &cvs[right_idx], 
+
+         b3p_merge_nodes(ctx->kf.key, ctx->kf.flags,
+                         &cvs[left_idx], &cvs[right_idx],
                          &cvs[left_idx], is_root);
-         
+
          stack_counts[left_idx] = new_count;
-         top--; // Pop right
+         top--;
       } else {
          break;
       }
     }
   }
 
-  // Collapse remaining stack from right to left
   while (top > 1) {
      size_t right_idx = top - 1;
      size_t left_idx = top - 2;
-     
+
      size_t new_count = stack_counts[left_idx] + stack_counts[right_idx];
      int is_root = (is_final && new_count == total_count);
 
-     b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, 
-                     &cvs[left_idx], &cvs[right_idx], 
+     b3p_merge_nodes(ctx->kf.key, ctx->kf.flags,
+                     &cvs[left_idx], &cvs[right_idx],
                      &cvs[left_idx], is_root);
-     
+
      stack_counts[left_idx] = new_count;
      top--;
   }
-  
+
   *out_root = cvs[0];
 }
 
+/* Method A
+   Chunk batching hashes contiguous ranges and reduces each batch into a CV
+   Final merge reduces the batch roots into the tree root */
 static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
   size_t simd_degree = blake3_simd_degree();
   if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
+
+  /* Batch size is chosen to amortize scheduling and reduction overhead
+     Larger batches reduce queue pressure, but increase per-task latency */
   size_t batch_step = simd_degree * 64;
 
   size_t num_batches = (ctx->num_chunks + batch_step - 1) / batch_step;
@@ -747,19 +750,19 @@ static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root)
   return 0;
 }
 
+/* Method B
+   Subtree batching hashes fixed-size subtrees per task
+   Final merge reduces subtree roots into the tree root */
 static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
-#if DEBUG_PARALLEL
-  fprintf(stderr, "[parallel] method B: input_len=%zu num_chunks=%zu nthreads=%zu\n", ctx->input_len, ctx->num_chunks, ctx->pool.nthreads);
-#endif
   size_t subtree_chunks = ctx->cfg.subtree_chunks;
   if (subtree_chunks == 0) {
     subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS;
   }
+
+  /* Power-of-two subtree sizes minimize merge irregularity */
   subtree_chunks = round_down_to_power_of_2(subtree_chunks);
+
   size_t num_subtrees = (ctx->num_chunks + subtree_chunks - 1) / subtree_chunks;
-#if DEBUG_PARALLEL
-  fprintf(stderr, "[parallel] subtree_chunks=%zu num_subtrees=%zu\n", subtree_chunks, num_subtrees);
-#endif
 
   if (b3p_ensure_scratch(ctx, num_subtrees) != 0)
     return -1;
@@ -780,23 +783,26 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_roo
     b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_subtrees, &job);
 
   b3p_taskgroup_wait(&g);
+
   b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1);
   return 0;
 }
 
+/* Serial fallback for contexts created with nthreads <= 1
+   Uses the same subtree partitioning logic without starting a worker pool */
 static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
   size_t subtree_chunks = ctx->cfg.subtree_chunks;
   if (subtree_chunks == 0) {
     subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS;
   }
   subtree_chunks = round_down_to_power_of_2(subtree_chunks);
+
   size_t num_subtrees = (ctx->num_chunks + subtree_chunks - 1) / subtree_chunks;
 
   if (b3p_ensure_scratch(ctx, num_subtrees) != 0)
     return -1;
 
-  size_t max_tmp = subtree_chunks;
-  b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(max_tmp);
+  b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(subtree_chunks);
   if (!tmp) return -1;
 
   int is_root = (num_subtrees == 1);
@@ -811,17 +817,13 @@ static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
     b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root);
     ctx->scratch_cvs[s] = root;
   }
-  
-  // free(tmp) removed because tmp is TLS
 
   b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1);
   return 0;
 }
 
-/* ============================================================================
- * Root computation
- * ===========================================================================*/
-
+/* Root computation dispatch
+   Uses serial path if no pool exists, otherwise selects the requested method */
 static int b3p_compute_root(
   struct b3p_ctx *ctx,
   b3p_method_t method,
@@ -845,6 +847,8 @@ static int b3p_compute_root(
   return rc;
 }
 
+/* Serial one-shot helper
+   This is intended for small buffers where parallel setup would dominate */
 int b3p_hash_buffer_serial(
   const uint8_t *input,
   size_t input_len,
@@ -872,22 +876,11 @@ int b3p_hash_buffer_serial(
   }
   ctx.kf.flags = flags;
 
-  // For small inputs, allocate on stack to avoid malloc overhead
-  // 1MB input -> 1024 chunks -> 32KB CVs. Safe.
-  // 4MB input -> 4096 chunks -> 128KB CVs. Safe.
-  // Above that, use malloc.
-  size_t needed_cvs = ctx.num_chunks;
-  
-  b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(needed_cvs);
+  b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(ctx.num_chunks);
   if (!tmp) return -1;
 
   b3_cv_bytes_t root = {0};
-  // We process the entire buffer as one range. Since this function is for serial execution
-  // of contiguous buffers, we treat the whole input as one "subtree" (or rather the whole tree).
-  // b3p_hash_range_to_root will handle reduction and ROOT flag (since is_root=1).
   b3p_hash_range_to_root(&ctx, 0, ctx.num_chunks, tmp, &root, 1);
-
-  // if (heap_tmp) free(heap_tmp); removed
 
   b3_output_root_impl(ctx.kf.key, ctx.kf.flags, root.bytes, 0, out, out_len);
   return 0;
