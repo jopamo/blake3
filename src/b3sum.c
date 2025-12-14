@@ -245,7 +245,16 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
             size_t have = 0;
             int read_failed = 0;
             while (have < (size_t)ctx.size) {
-                ssize_t r = read(fd, buf + have, (size_t)ctx.size - have);
+                ssize_t r;
+#if HAVE_PREADV2_NOWAIT
+                struct iovec iov = { .iov_base = buf + have, .iov_len = (size_t)ctx.size - have };
+                r = preadv2(fd, &iov, 1, -1, RWF_NOWAIT);
+                if (r < 0) {
+                    r = read(fd, buf + have, (size_t)ctx.size - have);
+                }
+#else
+                r = read(fd, buf + have, (size_t)ctx.size - have);
+#endif
                 if (r > 0) {
                     have += (size_t)r;
                     continue;
@@ -297,6 +306,8 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         }
         
         // Clamp threads based on file size
+        // Each task is B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN bytes.
+        // We shouldn't spawn more threads than tasks.
         size_t task_size = (size_t)B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN;
         size_t num_tasks = ((size_t)ctx.size + task_size - 1) / task_size;
         if (num_tasks < 1) num_tasks = 1;
@@ -727,7 +738,17 @@ static int hash_fd_stream_with_buffer(int fd, off_t filesize, uint8_t* output, u
 #endif
 
     for (;;) {
-        ssize_t r = read(fd, buf, buf_sz);
+        ssize_t r;
+#if HAVE_PREADV2_NOWAIT
+        struct iovec iov = { .iov_base = buf, .iov_len = buf_sz };
+        r = preadv2(fd, &iov, 1, -1, RWF_NOWAIT);
+        if (r < 0) {
+            r = read(fd, buf, buf_sz);
+        }
+#else
+        r = read(fd, buf, buf_sz);
+#endif
+
         if (r > 0) {
             blake3_hasher_update(&hasher, buf, (size_t)r);
             continue;

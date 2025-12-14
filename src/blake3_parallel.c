@@ -22,6 +22,24 @@ typedef struct {
 #include <stdio.h>
 #define DEBUG_PARALLEL 0
 
+// Thread-local scratch space for CVs (avoiding per-task malloc/alloca)
+static __thread b3_cv_bytes_t *g_tls_cv_buf = NULL;
+static __thread size_t g_tls_cv_cap = 0;
+
+static b3_cv_bytes_t* ensure_tls_cv_buffer(size_t count) {
+    if (count > g_tls_cv_cap) {
+        size_t new_cap = g_tls_cv_cap ? g_tls_cv_cap : 1024;
+        while (new_cap < count) new_cap *= 2;
+        
+        b3_cv_bytes_t *new_buf = realloc(g_tls_cv_buf, new_cap * sizeof(b3_cv_bytes_t));
+        if (!new_buf) return NULL;
+        
+        g_tls_cv_buf = new_buf;
+        g_tls_cv_cap = new_cap;
+    }
+    return g_tls_cv_buf;
+}
+
 /* ============================================================================
  * Worker pool data structures
  * ===========================================================================*/
@@ -394,6 +412,12 @@ static void *b3p_worker_main(void *arg) {
     }
   }
 
+  if (g_tls_cv_buf) {
+      free(g_tls_cv_buf);
+      g_tls_cv_buf = NULL;
+      g_tls_cv_cap = 0;
+  }
+
   return NULL;
 }
 
@@ -619,7 +643,8 @@ static void b3p_task_hash_subtrees(void *arg) {
 #if DEBUG_PARALLEL
   fprintf(stderr, "[parallel] max_tmp=%zu\n", max_tmp);
 #endif
-  b3_cv_bytes_t *tmp = (b3_cv_bytes_t*)alloca(max_tmp * sizeof(b3_cv_bytes_t));
+  b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(max_tmp);
+  if (!tmp) return; // Should handle error better? but void return
 
   for (;;) {
     size_t s = atomic_fetch_add_explicit(&job->next_subtree, 1, memory_order_relaxed);
@@ -758,7 +783,7 @@ static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
     return -1;
 
   size_t max_tmp = subtree_chunks;
-  b3_cv_bytes_t *tmp = (b3_cv_bytes_t*)malloc(max_tmp * sizeof(b3_cv_bytes_t));
+  b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(max_tmp);
   if (!tmp) return -1;
 
   int is_root = (num_subtrees == 1);
@@ -774,7 +799,7 @@ static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
     ctx->scratch_cvs[s] = root;
   }
   
-  free(tmp);
+  // free(tmp) removed because tmp is TLS
 
   b3p_reduce_in_place(ctx, ctx->scratch_cvs, num_subtrees, out_root, 1);
   return 0;
@@ -838,19 +863,10 @@ int b3p_hash_buffer_serial(
   // 1MB input -> 1024 chunks -> 32KB CVs. Safe.
   // 4MB input -> 4096 chunks -> 128KB CVs. Safe.
   // Above that, use malloc.
-  size_t max_stack_chunks = 4096; 
   size_t needed_cvs = ctx.num_chunks;
   
-  b3_cv_bytes_t *tmp;
-  b3_cv_bytes_t *heap_tmp = NULL;
-
-  if (needed_cvs <= max_stack_chunks) {
-      tmp = (b3_cv_bytes_t*)alloca(needed_cvs * sizeof(b3_cv_bytes_t));
-  } else {
-      heap_tmp = (b3_cv_bytes_t*)malloc(needed_cvs * sizeof(b3_cv_bytes_t));
-      if (!heap_tmp) return -1;
-      tmp = heap_tmp;
-  }
+  b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(needed_cvs);
+  if (!tmp) return -1;
 
   b3_cv_bytes_t root = {0};
   // We process the entire buffer as one range. Since this function is for serial execution
@@ -858,7 +874,7 @@ int b3p_hash_buffer_serial(
   // b3p_hash_range_to_root will handle reduction and ROOT flag (since is_root=1).
   b3p_hash_range_to_root(&ctx, 0, ctx.num_chunks, tmp, &root, 1);
 
-  if (heap_tmp) free(heap_tmp);
+  // if (heap_tmp) free(heap_tmp); removed
 
   b3_output_root_impl(ctx.kf.key, ctx.kf.flags, root.bytes, 0, out, out_len);
   return 0;
