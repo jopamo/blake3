@@ -107,5 +107,3 @@ See [HACKING.md](HACKING.md) for deep-dive documentation on internals and adding
 ## 📄 License
 
 This code is dual-licensed under CC0 1.0 Universal and Apache License 2.0, matching the upstream BLAKE3 repository.
-
-```
