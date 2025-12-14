@@ -9,137 +9,13 @@ const char* blake3_version(void) {
     return BLAKE3_VERSION_STRING;
 }
 
-INLINE void chunk_state_init(blake3_chunk_state* self, const uint32_t key[8], uint8_t flags) {
-    memcpy(self->cv, key, BLAKE3_KEY_LEN);
-    self->chunk_counter = 0;
-    memset(self->buf, 0, BLAKE3_BLOCK_LEN);
-    self->buf_len = 0;
-    self->blocks_compressed = 0;
-    self->flags = flags;
-}
-
-INLINE void chunk_state_reset(blake3_chunk_state* self, const uint32_t key[8], uint64_t chunk_counter) {
-    memcpy(self->cv, key, BLAKE3_KEY_LEN);
-    self->chunk_counter = chunk_counter;
-    self->blocks_compressed = 0;
-    memset(self->buf, 0, BLAKE3_BLOCK_LEN);
-    self->buf_len = 0;
-}
-
-INLINE size_t chunk_state_len(const blake3_chunk_state* self) {
-    return (BLAKE3_BLOCK_LEN * (size_t)self->blocks_compressed) + ((size_t)self->buf_len);
-}
-
-INLINE size_t chunk_state_fill_buf(blake3_chunk_state* self, const uint8_t* input, size_t input_len) {
-    size_t take = BLAKE3_BLOCK_LEN - ((size_t)self->buf_len);
-    if (take > input_len) {
-        take = input_len;
-    }
-    uint8_t* dest = self->buf + ((size_t)self->buf_len);
-    memcpy(dest, input, take);
-    self->buf_len += (uint8_t)take;
-    return take;
-}
-
-INLINE uint8_t chunk_state_maybe_start_flag(const blake3_chunk_state* self) {
-    if (self->blocks_compressed == 0) {
-        return CHUNK_START;
-    }
-    else {
-        return 0;
-    }
-}
-
-typedef struct {
-    uint32_t input_cv[8];
-    uint64_t counter;
-    uint8_t block[BLAKE3_BLOCK_LEN];
-    uint8_t block_len;
-    uint8_t flags;
-} output_t;
-
-INLINE output_t make_output(const uint32_t input_cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags) {
-    output_t ret;
-    memcpy(ret.input_cv, input_cv, 32);
-    memcpy(ret.block, block, BLAKE3_BLOCK_LEN);
-    ret.block_len = block_len;
-    ret.counter = counter;
-    ret.flags = flags;
-    return ret;
-}
-
-// Chaining values within a given chunk (specifically the compress_in_place
-// interface) are represented as words. This avoids unnecessary bytes<->words
-// conversion overhead in the portable implementation. However, the hash_many
-// interface handles both user input and parent node blocks, so it accepts
-// bytes. For that reason, chaining values in the CV stack are represented as
-// bytes.
-INLINE void output_chaining_value(const output_t* self, uint8_t cv[32]) {
-    uint32_t cv_words[8];
-    memcpy(cv_words, self->input_cv, 32);
-    blake3_compress_in_place(cv_words, self->block, self->block_len, self->counter, self->flags);
-    store_cv_words(cv, cv_words);
-}
-
-INLINE void output_root_bytes(const output_t* self, uint64_t seek, uint8_t* out, size_t out_len) {
-    if (out_len == 0) {
-        return;
-    }
-    uint64_t output_block_counter = seek / 64;
-    size_t offset_within_block = seek % 64;
-    uint8_t wide_buf[64];
-    if (offset_within_block) {
-        blake3_compress_xof(self->input_cv, self->block, self->block_len, output_block_counter, self->flags | ROOT, wide_buf);
-        const size_t available_bytes = 64 - offset_within_block;
-        const size_t bytes = out_len > available_bytes ? available_bytes : out_len;
-        memcpy(out, wide_buf + offset_within_block, bytes);
-        out += bytes;
-        out_len -= bytes;
-        output_block_counter += 1;
-    }
-    if (out_len / 64) {
-        blake3_xof_many(self->input_cv, self->block, self->block_len, output_block_counter, self->flags | ROOT, out, out_len / 64);
-    }
-    output_block_counter += out_len / 64;
-    out += out_len & -64;
-    out_len -= out_len & -64;
-    if (out_len) {
-        blake3_compress_xof(self->input_cv, self->block, self->block_len, output_block_counter, self->flags | ROOT, wide_buf);
-        memcpy(out, wide_buf, out_len);
-    }
-}
-
-INLINE void chunk_state_update(blake3_chunk_state* self, const uint8_t* input, size_t input_len) {
-    if (self->buf_len > 0) {
-        size_t take = chunk_state_fill_buf(self, input, input_len);
-        input += take;
-        input_len -= take;
-        if (input_len > 0) {
-            blake3_compress_in_place(self->cv, self->buf, BLAKE3_BLOCK_LEN, self->chunk_counter, self->flags | chunk_state_maybe_start_flag(self));
-            self->blocks_compressed += 1;
-            self->buf_len = 0;
-            memset(self->buf, 0, BLAKE3_BLOCK_LEN);
-        }
-    }
-
-    while (input_len > BLAKE3_BLOCK_LEN) {
-        blake3_compress_in_place(self->cv, input, BLAKE3_BLOCK_LEN, self->chunk_counter, self->flags | chunk_state_maybe_start_flag(self));
-        self->blocks_compressed += 1;
-        input += BLAKE3_BLOCK_LEN;
-        input_len -= BLAKE3_BLOCK_LEN;
-    }
-
-    chunk_state_fill_buf(self, input, input_len);
-}
-
-INLINE output_t chunk_state_output(const blake3_chunk_state* self) {
-    uint8_t block_flags = self->flags | chunk_state_maybe_start_flag(self) | CHUNK_END;
-    return make_output(self->cv, self->buf, self->buf_len, self->chunk_counter, block_flags);
-}
-
-INLINE output_t parent_output(const uint8_t block[BLAKE3_BLOCK_LEN], const uint32_t key[8], uint8_t flags) {
-    return make_output(key, block, BLAKE3_BLOCK_LEN, 0, flags | PARENT);
-}
+INLINE void chunk_state_update(blake3_chunk_state* self, const uint8_t* input, size_t input_len);
+INLINE output_t chunk_state_output(const blake3_chunk_state* self);
+INLINE void output_chaining_value(const output_t* self, uint8_t cv[32]);
+INLINE void output_root_bytes(const output_t* self, uint64_t seek, uint8_t* out, size_t out_len);
+INLINE output_t parent_output(const uint8_t block[BLAKE3_BLOCK_LEN], const uint32_t key[8], uint8_t flags);
+INLINE void chunk_state_reset(blake3_chunk_state* self, const uint32_t key[8], uint64_t chunk_counter);
+INLINE void chunk_state_init(blake3_chunk_state* self, const uint32_t key[8], uint8_t flags);
 
 // Given some input larger than one chunk, return the number of bytes that
 // should go in the left subtree. This is the largest power-of-2 number of
@@ -629,16 +505,11 @@ void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags,
                     out_cv);
 }
 
-void b3_output_root_impl(const uint32_t key[8], uint8_t flags,
-                    const uint8_t root_cv[32], uint64_t seek,
+void b3_output_root_impl(const uint32_t input_cv[8], uint8_t block_flags,
+                    const uint8_t *block, size_t block_len,
+                    uint64_t counter,
+                    uint64_t seek,
                     uint8_t *out, size_t out_len) {
-    // Parallel implementation produces the final Root CV (with ROOT flag applied).
-    // We just copy it to output (truncating if needed).
-    // Note: This does NOT support XOF seek or output > 32 bytes for now.
-    // Assuming out_len <= 32 and seek == 0.
-    size_t copy_len = out_len < 32 ? out_len : 32;
-    memcpy(out, root_cv, copy_len);
-    if (out_len > 32) {
-        memset(out + 32, 0, out_len - 32); // fill remainder with 0
-    }
+    output_t output = make_output(input_cv, block, block_len, counter, block_flags | ROOT);
+    output_root_bytes(&output, seek, out, out_len);
 }
