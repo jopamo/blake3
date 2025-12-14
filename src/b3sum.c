@@ -1,5 +1,14 @@
 /*
-b3sum:
+ b3sum
+
+ High-performance BLAKE3 checksum utility
+
+ Design goals
+ - saturate CPU and I/O in parallel
+ - avoid per-file and per-chunk allocations in hot paths
+ - prefer contiguous buffers (mmap or read-all) when possible
+ - keep synchronization minimal and localized
+ - scale well from tiny files to large multi-MiB inputs
 */
 
 #define _GNU_SOURCE
@@ -13,6 +22,7 @@ b3sum:
 #include <getopt.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +50,7 @@ b3sum:
 #define HAVE_PREADV2_NOWAIT 0
 #endif
 
-/* io buffer sizing */
+/* I/O buffer sizing tuned for throughput on typical NVMe and page cache */
 #define DEFAULT_BUF (1 << 20) /* 1 MiB default streaming buffer */
 #define MAX_BUF (8 << 20)     /* 8 MiB upper cap for a single buffer */
 
@@ -53,39 +63,38 @@ b3sum:
 #define STREAM_BUF_MIN ((size_t)DEFAULT_BUF)
 #define STREAM_BUF_MAX ((size_t)MAX_BUF)
 
-/* task queue sizing */
-#define TASKQ_CAP 32768 /* power of two */
+/* Task queue sizing as a power of two for fast masking */
+#define TASKQ_CAP 32768
 #define TASKQ_MASK (TASKQ_CAP - 1)
 
-/* thread local IO scratch */
+/* Per-thread reusable I/O buffer
+   Each worker owns a private buffer to avoid malloc/free churn and false sharing */
 static __thread uint8_t* tls_io_buf = NULL;
 static __thread size_t tls_io_buf_cap = 0;
 
-static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;  // serialize stdout
+/* stdout is the only serialized resource
+   Keep the lock held only during printing */
+static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* --- forward declarations --- */
+/* Forward declarations */
 static int blake3_hash_region_tree(const uint8_t* data, size_t len, uint8_t out_hash[BLAKE3_OUT_LEN]);
 
-/* --- tls buffer helpers --- */
+/* Thread-local buffer helpers */
 
-// ensure_tls_io_buffer
-// ensures the thread-local I/O buffer is at least min_bytes large
-// grows and reallocates with proper alignment if needed
-// returns pointer to buffer or NULL on allocation failure
-// sets *actual_size to the buffer capacity if provided
-
+/* ensure_tls_io_buffer
+   Ensures the calling thread has a private I/O buffer of at least min_bytes
+   Fast path returns the existing buffer when large enough
+   Growth rounds up to an alignment boundary suitable for page-cache friendly I/O */
 static uint8_t* ensure_tls_io_buffer(size_t min_bytes, size_t* actual_size) {
     if (min_bytes < STREAM_BUF_MIN)
         min_bytes = STREAM_BUF_MIN;
 
-    // fast path if already large enough
     if (min_bytes <= tls_io_buf_cap) {
         if (actual_size)
             *actual_size = tls_io_buf_cap;
         return tls_io_buf;
     }
 
-    // round up to alignment boundary
     size_t aligned = (min_bytes + (IO_BUFFER_ALIGNMENT - 1)) & ~(IO_BUFFER_ALIGNMENT - 1);
 
     uint8_t* newbuf;
@@ -108,21 +117,17 @@ static uint8_t* ensure_tls_io_buffer(size_t min_bytes, size_t* actual_size) {
     return tls_io_buf;
 }
 
-// release_tls_io_buffer
-// frees the thread-local I/O buffer and resets tracking fields
-// safe to call multiple times
+/* release_tls_io_buffer
+   Frees the calling thread's buffer at thread exit
+   Safe to call multiple times */
 static void release_tls_io_buffer(void) {
     free(tls_io_buf);
     tls_io_buf = NULL;
     tls_io_buf_cap = 0;
 }
 
-
-
-/* ──────────────── program options ────────────────
-   holds parsed CLI flags and operational modes
-   all fields are ints for easy zero-init via memset
-*/
+/* Program options
+   Stored as ints for easy zero-init */
 typedef struct {
     int check;           // verify hashes instead of printing
     int tag;             // include BLAKE3 tag header
@@ -135,75 +140,54 @@ typedef struct {
     int jobs;            // number of worker threads (0 = auto)
 } program_opts;
 
-/* ──────────────── task types ────────────────
-   currently we only enqueue file hashing tasks
-*/
 typedef enum { TASK_FILE = 0 } task_kind;
 
-/* ──────────────── work queue item ────────────────
-   represents one file hashing job; includes cached metadata
-   metadata caching saves syscalls on many small files
-*/
+/* Work queue item
+   Caches metadata to reduce syscalls when walking many small files */
 typedef struct file_task {
     task_kind kind;
-    char* filename;     // owned by task
-    int is_check_mode;  // true if comparing to expected hash
+    char* filename;
+    int is_check_mode;
     uint8_t expected_hash[BLAKE3_OUT_LEN];
-    struct stat st;  // cached stat(2) data
-    int have_stat;   // nonzero if st is valid
+    struct stat st;
+    int have_stat;
 } file_task;
 
-/* ──────────────── global worker-pool state ──────────────── */
-
-
-// task queue implemented as a fixed-size ring buffer
-static _Atomic size_t q_head = 0;  // next task to consume
-static _Atomic size_t q_tail = 0;  // next task to produce
+/* Global lock-free ring buffer state */
+static _Atomic size_t q_head = 0;
+static _Atomic size_t q_tail = 0;
 static file_task* task_ring[TASKQ_CAP];
 
-// sleeping coordination for idle consumers
+/* Sleep coordination for idle consumers */
 static pthread_mutex_t q_sleep_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_sleep_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic int q_sleep_counter = 0;
 
-// indicates no more tasks will be enqueued
+/* Signals no more tasks will be enqueued */
 static _Atomic int done_submitting_tasks = 0;
 
-// result flags aggregated across workers
+/* Aggregated results
+   Updated by workers, read by main */
 static int any_failure_global = 0;
 static int any_format_error_global = 0;
 
-/* ──────────────── per-file context ────────────────
-   holds file state for hashing (mmap, size, etc.)
-*/
+/* Per-file context */
 typedef struct {
-    int fd;                     // open file descriptor
-    off_t size;                 // total file size
-    const uint8_t* map;         // memory-mapped region (if used)
-    size_t map_len;             // length of mapped region
-    size_t total_chunks;        // ceil(size / BLAKE3_CHUNK_LEN)
-    _Atomic int had_error;      // nonzero if any I/O or hash error
-    int io_error_code;          // saved errno if had_error != 0
+    int fd;
+    off_t size;
+    const uint8_t* map;
+    size_t map_len;
+    size_t total_chunks;
+    _Atomic int had_error;
+    int io_error_code;
 } perfile_ctx;
 
-// forward declarations
 static int hash_fd_stream_fast(int fd, off_t filesize, uint8_t* output);
 
-
-
-
-
-
-
-
-
-
-
-// hash_regular_file_parallel
-// hashes a regular file using BLAKE3 tree mode
-// - mmaps file when possible, using parallel hash engine for adaptive method selection
-// - falls back to streaming hash for non-mmapable files
-// returns 0 on success, -1 on error (errno set)
+/* Hash a regular file with a preference for contiguous-buffer paths
+   mmap is used when possible for large files
+   small files may be read fully into a TLS buffer and hashed one-shot
+   streaming is the fallback for non-mmapable cases */
 static int hash_regular_file_parallel(const program_opts* opts, const char* name, int fd, const struct stat* st, uint8_t out_hash[BLAKE3_OUT_LEN]) {
     (void)opts;
     (void)name;
@@ -214,7 +198,6 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
     atomic_store_explicit(&ctx.had_error, 0, memory_order_release);
     ctx.io_error_code = 0;
 
-    // try mmap for read-mostly workloads
     if (ctx.size > 0) {
         void* m = mmap(NULL, (size_t)ctx.size, PROT_READ, MAP_SHARED, fd, 0);
         if (m != MAP_FAILED) {
@@ -226,19 +209,15 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         }
     }
 
-    // total chunk count
     ctx.total_chunks = (ctx.size + BLAKE3_CHUNK_LEN - 1) / BLAKE3_CHUNK_LEN;
     if (ctx.total_chunks == 0)
         ctx.total_chunks = 1;
 
-    // Use unified b3p path for contiguous buffers (mmap or malloc)
     const uint8_t *input_buf = NULL;
-    int should_unmap = 0;
 
     if (ctx.map) {
         input_buf = ctx.map;
     } else if (ctx.size <= (8u << 20)) {
-        // Not mmapped, but small enough to read into memory
         size_t buf_sz = 0;
         uint8_t* buf = ensure_tls_io_buffer((size_t)ctx.size, &buf_sz);
         if (buf && buf_sz >= (size_t)ctx.size) {
@@ -277,7 +256,6 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
     }
 
     if (input_buf) {
-        // Convert IV to bytes (little-endian)
         uint8_t iv_bytes[BLAKE3_KEY_LEN];
         for (size_t i = 0; i < 8; i++) {
             uint32_t w = IV[i];
@@ -287,7 +265,8 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
             iv_bytes[i * 4 + 3] = (uint8_t)(w >> 24);
         }
 
-        // Fast path for small files (<= 1 MiB): use stack-allocated serial hasher
+        /* Small-file fast path
+           Avoids parallel engine setup overhead for latency-sensitive sizes */
         if ((size_t)ctx.size <= (1024 * 1024)) {
              int rc = b3p_hash_buffer_serial(input_buf, (size_t)ctx.size, iv_bytes, 0, out_hash, BLAKE3_OUT_LEN);
              if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
@@ -297,24 +276,22 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
              }
              return 0;
         }
-        
-        // Configure parallel engine (serial if small)
+
         b3p_config_t cfg = b3p_config_default();
         int nthreads = opts->jobs;
         if (nthreads == 0) {
             nthreads = get_nprocs();
         }
-        
-        // Clamp threads based on file size
-        // Each task is B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN bytes.
-        // We shouldn't spawn more threads than tasks.
+
+        /* Clamp threads to the number of available coarse work units
+           Prevents oversubscription when hashing a single medium file */
         size_t task_size = (size_t)B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN;
         size_t num_tasks = ((size_t)ctx.size + task_size - 1) / task_size;
         if (num_tasks < 1) num_tasks = 1;
         if ((size_t)nthreads > num_tasks) {
             nthreads = (int)num_tasks;
         }
-        
+
         cfg.nthreads = nthreads;
 
         b3p_ctx_t* b3p = b3p_create(&cfg);
@@ -323,12 +300,12 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
             errno = ENOMEM;
             return -1;
         }
-        
+
         int rc = b3p_hash_one_shot(b3p, input_buf, (size_t)ctx.size, iv_bytes, 0, B3P_METHOD_AUTO, out_hash, BLAKE3_OUT_LEN);
         b3p_destroy(b3p);
-        
+
         if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
-        
+
         if (rc != 0) {
             errno = EIO;
             return -1;
@@ -336,19 +313,16 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         return 0;
     }
 
-    // Fallback to streaming hash
+    /* Streaming fallback
+       Handles special files, non-mmapable inputs, and large sequential reads */
     int rc = hash_fd_stream_fast(fd, ctx.size, out_hash);
     if (ctx.map)
         munmap((void*)ctx.map, ctx.map_len);
     return rc;
 }
 
-/* ─── spin-wait hint ────────────────────────────────────────────────
-   cpu_relax() gives the processor a short pause hint inside spin loops
-   prevents excessive pipeline stalls and power waste during contention
-   maps to the correct intrinsic per architecture
-*/
-
+/* cpu_relax gives the CPU a short hint in spin loops
+   Reduces contention cost in tight CAS retry loops */
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define cpu_relax() _mm_pause()
@@ -358,32 +332,25 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
 #define cpu_relax() ((void)0)
 #endif
 
-/* ─── queue sentinel ────────────────────────────────────────────────
-   special non-null marker for “no task yet, but not done”
-   must differ from NULL so workers can sleep safely without consuming end flag
-*/
+/* Sentinel marker for "queue empty but producers not done" */
 #ifndef TASK_EMPTY_NOT_DONE
 #define TASK_EMPTY_NOT_DONE ((file_task*)0x1)
 #endif
 
-// enqueue_task_lockfree
-// pushes one task pointer into the global ring buffer
-// returns 0 on success, -1 if queue is full
-// lock-free for the fast path; only locks for condition wake-up when consumers sleep
+/* enqueue_task_lockfree
+   Fast producer enqueue using CAS on q_tail
+   Wakes sleepers only when needed */
 static int enqueue_task_lockfree(file_task* t) {
     for (;;) {
         size_t tail = atomic_load_explicit(&q_tail, memory_order_relaxed);
         size_t head = atomic_load_explicit(&q_head, memory_order_acquire);
 
-        // ring full: (tail - head) == TASKQ_CAP
         if ((tail - head) >= TASKQ_CAP)
             return -1;
 
-        // claim a slot
         if (atomic_compare_exchange_weak_explicit(&q_tail, &tail, tail + 1, memory_order_acq_rel, memory_order_relaxed)) {
             task_ring[tail & TASKQ_MASK] = t;
 
-            // only wake if a sleeper exists
             if (atomic_load_explicit(&q_sleep_counter, memory_order_relaxed) > 0) {
                 pthread_mutex_lock(&q_sleep_mutex);
                 pthread_cond_broadcast(&q_sleep_cond);
@@ -391,24 +358,22 @@ static int enqueue_task_lockfree(file_task* t) {
             }
             return 0;
         }
-        // CAS failed: another producer raced; retry
-        cpu_relax();  // optional spin hint
+
+        cpu_relax();
     }
 }
 
-// enqueue_task
-// retries until the task is successfully pushed
+/* enqueue_task
+   Simple retry wrapper
+   Backpressure yields when the ring is full */
 static void enqueue_task(file_task* t) {
     while (enqueue_task_lockfree(t) != 0)
         sched_yield();
 }
 
-// dequeue_task_lockfree
-// pops a task pointer from the global ring buffer
-// returns:
-//   - valid task pointer if available
-//   - TASK_EMPTY_NOT_DONE if queue empty but producers may add more
-//   - NULL if queue empty and producers are finished
+/* dequeue_task_lockfree
+   Fast consumer dequeue using CAS on q_head
+   Returns NULL only when producers are finished and queue is drained */
 static file_task* dequeue_task_lockfree(void) {
     for (;;) {
         size_t head = atomic_load_explicit(&q_head, memory_order_relaxed);
@@ -420,36 +385,31 @@ static file_task* dequeue_task_lockfree(void) {
             return TASK_EMPTY_NOT_DONE;
         }
 
-        // claim next task
         if (atomic_compare_exchange_weak_explicit(&q_head, &head, head + 1, memory_order_acq_rel, memory_order_relaxed)) {
             return task_ring[head & TASKQ_MASK];
         }
-        cpu_relax();  // optional spin hint
+
+        cpu_relax();
     }
 }
 
-// dequeue_task
-// blocking consumer side of the task queue
-// waits via condition variable when queue is empty but producers still active
-// returns:
-//   - valid file_task* when available
-//   - NULL when producers are done and queue fully drained
+/* dequeue_task
+   Blocking wrapper for consumers
+   Sleeps only when the queue is empty and producers are still active */
 static file_task* dequeue_task(void) {
     for (;;) {
         file_task* t = dequeue_task_lockfree();
         if (t == NULL)
-            return NULL;  // all done
+            return NULL;
         if (t != TASK_EMPTY_NOT_DONE)
-            return t;  // got a task
+            return t;
 
-        // sleep until producer signals new work
         pthread_mutex_lock(&q_sleep_mutex);
         atomic_fetch_add_explicit(&q_sleep_counter, 1, memory_order_relaxed);
 
         size_t head = atomic_load_explicit(&q_head, memory_order_relaxed);
         size_t tail = atomic_load_explicit(&q_tail, memory_order_acquire);
 
-        // only sleep if queue still empty and not finished
         if (head == tail && !atomic_load_explicit(&done_submitting_tasks, memory_order_acquire))
             pthread_cond_wait(&q_sleep_cond, &q_sleep_mutex);
 
@@ -457,8 +417,6 @@ static file_task* dequeue_task(void) {
         pthread_mutex_unlock(&q_sleep_mutex);
     }
 }
-
-/* ──────────────── CLI and formatting helpers ──────────────── */
 
 static void print_help(void) {
     puts(
@@ -479,20 +437,32 @@ static void print_help(void) {
 }
 
 static void print_version(void) {
-    puts("b3sum (optimized build)");
+    puts("b3sum");
 }
 
-// handle_options
-// parses command-line flags into opts
-// returns index of first non-option argument or 0 on --help/--version, -1 on error
+/* handle_options
+   Parses command-line flags into opts
+   Returns index of first non-option argument
+   Returns 0 when --help or --version was handled
+   Returns -1 on error */
 static int handle_options(int argc, char** argv, program_opts* opts) {
     memset(opts, 0, sizeof(*opts));
-    opts->jobs = 0;  // auto
+    opts->jobs = 0;
 
-    static const struct option long_opts[] = {{"check", no_argument, NULL, 'c'},          {"tag", no_argument, NULL, 't'},     {"zero", no_argument, NULL, 'z'},
-                                              {"ignore-missing", no_argument, NULL, 'i'}, {"quiet", no_argument, NULL, 'q'},   {"status", no_argument, NULL, 's'},
-                                              {"strict", no_argument, NULL, 'S'},         {"warn", no_argument, NULL, 'w'},    {"jobs", required_argument, NULL, 'j'},
-                                              {"help", no_argument, NULL, 'h'},           {"version", no_argument, NULL, 'v'}, {0, 0, 0, 0}};
+    static const struct option long_opts[] = {
+        {"check", no_argument, NULL, 'c'},
+        {"tag", no_argument, NULL, 't'},
+        {"zero", no_argument, NULL, 'z'},
+        {"ignore-missing", no_argument, NULL, 'i'},
+        {"quiet", no_argument, NULL, 'q'},
+        {"status", no_argument, NULL, 's'},
+        {"strict", no_argument, NULL, 'S'},
+        {"warn", no_argument, NULL, 'w'},
+        {"jobs", required_argument, NULL, 'j'},
+        {"help", no_argument, NULL, 'h'},
+        {"version", no_argument, NULL, 'v'},
+        {0, 0, 0, 0}
+    };
 
     int opt;
     while ((opt = getopt_long(argc, argv, "ctziqsSwj:hv", long_opts, NULL)) != -1) {
@@ -544,9 +514,9 @@ static int handle_options(int argc, char** argv, program_opts* opts) {
     return optind;
 }
 
-// unescape_filename
-// converts "\n" → newline and "\\" → '\' in place
-// returns heap-allocated decoded string or NULL on OOM
+/* unescape_filename
+   Converts "\n" to newline and "\\\\" to '\'
+   Returns heap-allocated decoded string */
 static char* unescape_filename(const char* in) {
     size_t len = strlen(in);
     char* out = malloc(len + 1);
@@ -561,8 +531,7 @@ static char* unescape_filename(const char* in) {
                 out[j++] = '\n';
                 i += 2;
                 continue;
-            }
-            else if (next == '\\') {
+            } else if (next == '\\') {
                 out[j++] = '\\';
                 i += 2;
                 continue;
@@ -574,8 +543,9 @@ static char* unescape_filename(const char* in) {
     return out;
 }
 
-// print_hash
-// prints a formatted BLAKE3 hash and filename with optional escaping/tag/null terminator
+/* print_hash
+   Prints the digest and filename
+   Tag and escaping match common checksum tool behavior */
 static void print_hash(const uint8_t* hash, const char* filename, int tag, int zero) {
     if (tag)
         fputs("BLAKE3 ", stdout);
@@ -589,14 +559,16 @@ static void print_hash(const uint8_t* hash, const char* filename, int tag, int z
     }
 
     int needs_escape = 0;
-    for (const char* p = filename; *p; ++p)
+    for (const char* p = filename; *p; ++p) {
         if (*p == '\n' || *p == '\\') {
             needs_escape = 1;
             break;
         }
+    }
 
     if (needs_escape)
         putchar('\\');
+
     fputs("  ", stdout);
 
     for (const char* p = filename; *p; ++p) {
@@ -607,18 +579,18 @@ static void print_hash(const uint8_t* hash, const char* filename, int tag, int z
         else
             putchar(*p);
     }
+
     putchar('\n');
 }
 
-// parse_hex_hash
-// decodes a 64-char hex string into 32-byte hash
-// returns 0 on success, -1 on invalid input
+/* parse_hex_hash
+   Decodes a 64-char hex string into 32 bytes */
 static int parse_hex_hash(const char* hex, uint8_t* out) {
     for (size_t i = 0; i < BLAKE3_OUT_LEN; i++) {
         unsigned char a = hex[2 * i], b = hex[2 * i + 1];
         if (!isxdigit(a) || !isxdigit(b))
             return -1;
-        char tmp[3] = {a, b, 0};
+        char tmp[3] = { (char)a, (char)b, 0 };
         unsigned long v = strtoul(tmp, NULL, 16);
         if (v > 0xFF)
             return -1;
@@ -627,16 +599,14 @@ static int parse_hex_hash(const char* hex, uint8_t* out) {
     return 0;
 }
 
-// parse_check_line
-// parses one checksum line (hex + "  filename") and outputs hash + decoded filename
-// supports BSD-style "BLAKE3 " prefix and escaped filenames
-// returns 0 on success, -1 on format/alloc error
+/* parse_check_line
+   Parses one checksum line into filename and expected digest
+   Supports optional BSD-style prefix and escaped filenames */
 static int parse_check_line(const char* line_in, const program_opts* opts, char** filename_out, uint8_t* hash_out) {
     char* line = strdup(line_in);
     if (!line)
         return -1;
 
-    // strip trailing newline/CR
     char* end = line + strlen(line);
     while (end > line && (end[-1] == '\n' || end[-1] == '\r'))
         *--end = '\0';
@@ -687,9 +657,8 @@ static int parse_check_line(const char* line_in, const program_opts* opts, char*
     return 0;
 }
 
-// blake3_hash_region_tree
-// hashes a contiguous memory region using standard BLAKE3 tree mode
-// returns 0 on success
+/* blake3_hash_region_tree
+   Serial reference path for hashing a contiguous region */
 static int blake3_hash_region_tree(const uint8_t* data, size_t len, uint8_t out_hash[BLAKE3_OUT_LEN]) {
     blake3_hasher h;
     blake3_hasher_init(&h);
@@ -698,10 +667,9 @@ static int blake3_hash_region_tree(const uint8_t* data, size_t len, uint8_t out_
     return 0;
 }
 
-// hash_fd_stream_with_buffer
-// hashes an open file descriptor using a user-supplied buffer
-// uses sequential reads and supports full-buffer fast path for small files
-// returns 0 on success, -1 on error (errno set)
+/* hash_fd_stream_with_buffer
+   Streaming hash for non-mmapable or special files
+   Uses a caller-provided buffer to avoid allocation */
 static int hash_fd_stream_with_buffer(int fd, off_t filesize, uint8_t* output, uint8_t* buf, size_t buf_sz) {
     if (!buf || buf_sz < 1024) {
         errno = ENOMEM;
@@ -711,7 +679,6 @@ static int hash_fd_stream_with_buffer(int fd, off_t filesize, uint8_t* output, u
     blake3_hasher hasher;
     blake3_hasher_init(&hasher);
 
-    // fast path: entire file fits in buffer
     if (filesize > 0 && (size_t)filesize <= buf_sz) {
         size_t want = (size_t)filesize;
         size_t have = 0;
@@ -764,14 +731,11 @@ static int hash_fd_stream_with_buffer(int fd, off_t filesize, uint8_t* output, u
     return 0;
 }
 
-// hash_fd_stream_fast
-// fast wrapper around hash_fd_stream_with_buffer()
-// chooses optimal TLS buffer size and delegates streaming
-// returns 0 on success or -1 on error (errno set)
+/* hash_fd_stream_fast
+   Selects an appropriate TLS buffer size and streams */
 static int hash_fd_stream_fast(int fd, off_t filesize, uint8_t* output) {
     size_t request = STREAM_BUF_MAX;
 
-    // shrink buffer if file smaller than STREAM_BUF_MAX
     if (filesize > 0 && (size_t)filesize < request)
         request = (size_t)filesize;
 
@@ -785,11 +749,8 @@ static int hash_fd_stream_fast(int fd, off_t filesize, uint8_t* output) {
     return hash_fd_stream_with_buffer(fd, filesize, output, buf, buf_sz);
 }
 
-/* ──────────────── enqueue helpers ──────────────── */
+/* enqueue helpers */
 
-// enqueue_task_hash_stat
-// enqueues a file hash task with optional pre-fetched stat(2) metadata
-// ensures allocation failures exit immediately
 static void enqueue_task_hash_stat(const char* filename, const struct stat* st_opt) {
     file_task* t = calloc(1, sizeof(*t));
     if (!t) {
@@ -811,8 +772,7 @@ static void enqueue_task_hash_stat(const char* filename, const struct stat* st_o
     if (st_opt) {
         t->st = *st_opt;
         t->have_stat = 1;
-    }
-    else {
+    } else {
         memset(&t->st, 0, sizeof(t->st));
         t->have_stat = 0;
     }
@@ -820,15 +780,10 @@ static void enqueue_task_hash_stat(const char* filename, const struct stat* st_o
     enqueue_task(t);
 }
 
-// enqueue_task_hash
-// convenience wrapper: enqueue a hash task without stat info
 __attribute__((unused)) static void enqueue_task_hash(const char* filename) {
     enqueue_task_hash_stat(filename, NULL);
 }
 
-// enqueue_task_check
-// enqueues a checksum verification task with expected digest
-// exits on allocation failure for consistent robustness
 static void enqueue_task_check(const char* filename, const uint8_t expected[BLAKE3_OUT_LEN]) {
     file_task* t = calloc(1, sizeof(*t));
     if (!t) {
@@ -853,16 +808,13 @@ static void enqueue_task_check(const char* filename, const uint8_t expected[BLAK
     enqueue_task(t);
 }
 
-// dir_stack
-// simple dynamic stack for directory paths (DFS)
+/* dir_stack implements a minimal dynamic stack for DFS */
 typedef struct {
     char** data;
     size_t len;
     size_t cap;
 } dir_stack;
 
-// ds_push
-// pushes a copy of path onto the stack, growing if needed
 static void ds_push(dir_stack* s, const char* path) {
     if (s->len == s->cap) {
         size_t new_cap = s->cap ? s->cap * 2 : 16;
@@ -883,16 +835,13 @@ static void ds_push(dir_stack* s, const char* path) {
     s->data[s->len++] = copy;
 }
 
-// ds_pop
-// pops a path pointer from the stack (caller must free)
 static char* ds_pop(dir_stack* s) {
     return (s->len == 0) ? NULL : s->data[--s->len];
 }
 
-// walk_path_streaming
-// performs a non-recursive DFS over root_path
-// enqueues regular files for hashing, recurses into subdirectories
-// errors (e.g., unreadable dirs or files) are still enqueued for worker reporting
+/* walk_path_streaming
+   Non-recursive DFS to avoid deep recursion overhead
+   Enqueues tasks eagerly to keep worker threads busy */
 static void walk_path_streaming(const program_opts* opts, const char* root_path) {
     (void)opts;
 
@@ -902,13 +851,11 @@ static void walk_path_streaming(const program_opts* opts, const char* root_path)
         return;
     }
 
-    // handle single file or symlink
     if (!S_ISDIR(st.st_mode)) {
         enqueue_task_hash_stat(root_path, &st);
         return;
     }
 
-    // initialize stack with the starting directory
     dir_stack stack = {0};
     ds_push(&stack, root_path);
 
@@ -925,7 +872,6 @@ static void walk_path_streaming(const program_opts* opts, const char* root_path)
         while ((de = readdir(d)) != NULL) {
             const char* n = de->d_name;
 
-            // skip "." and ".."
             if (n[0] == '.' && (n[1] == '\0' || (n[1] == '.' && n[2] == '\0')))
                 continue;
 
@@ -934,7 +880,6 @@ static void walk_path_streaming(const program_opts* opts, const char* root_path)
             int slash = (dl && dirpath[dl - 1] != '/');
             int written = snprintf(child_path, sizeof(child_path), slash ? "%s/%s" : "%s%s", dirpath, n);
             if (written < 0 || (size_t)written >= sizeof(child_path)) {
-                // skip paths too long
                 fprintf(stderr, "warning: path too long, skipped: %s/%s\n", dirpath, n);
                 continue;
             }
@@ -954,7 +899,6 @@ static void walk_path_streaming(const program_opts* opts, const char* root_path)
         closedir(d);
         free(dirpath);
 
-        // wake sleeping workers periodically so they can drain the queue
         pthread_mutex_lock(&q_sleep_mutex);
         pthread_cond_broadcast(&q_sleep_cond);
         pthread_mutex_unlock(&q_sleep_mutex);
@@ -963,10 +907,10 @@ static void walk_path_streaming(const program_opts* opts, const char* root_path)
     free(stack.data);
 }
 
-// worker_main
-// worker thread entry point
-// consumes tasks from global queue, hashes files or stdin, and prints output
-// exits when no tasks remain
+/* worker_main
+   Worker thread loop
+   Hashing and I/O happen fully parallel
+   Only printing is serialized */
 static void* worker_main(void* arg) {
     const program_opts* opts = (const program_opts*)arg;
     uint8_t out[BLAKE3_OUT_LEN];
@@ -974,7 +918,7 @@ static void* worker_main(void* arg) {
     for (;;) {
         file_task* t = dequeue_task();
         if (!t)
-            break;  // no more tasks
+            break;
 
         if (t->kind != TASK_FILE) {
             free(t->filename);
@@ -986,14 +930,12 @@ static void* worker_main(void* arg) {
         int rc = 0;
         int saved_errno = 0;
 
-        // ───── handle STDIN path ─────
         if (strcmp(name, "-") == 0) {
             struct stat stin;
             if (fstat(STDIN_FILENO, &stin) != 0) {
                 rc = -1;
                 saved_errno = errno;
-            }
-            else {
+            } else {
                 rc = hash_fd_stream_fast(STDIN_FILENO, stin.st_size, out);
                 if (rc != 0)
                     saved_errno = errno;
@@ -1004,14 +946,12 @@ static void* worker_main(void* arg) {
                 if (rc == 0 && memcmp(t->expected_hash, out, BLAKE3_OUT_LEN) == 0) {
                     if (!opts->quiet && !opts->status)
                         printf("%s: OK\n", name);
-                }
-                else {
+                } else {
                     any_failure_global = 1;
                     if (!opts->status)
                         printf("%s: FAILED\n", name);
                 }
-            }
-            else {
+            } else {
                 if (rc == 0 && !opts->status)
                     print_hash(out, name, opts->tag, opts->zero);
                 else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
@@ -1025,10 +965,8 @@ static void* worker_main(void* arg) {
             continue;
         }
 
-        // ───── handle regular file path ─────
         int oflags = O_RDONLY | O_CLOEXEC;
 #ifdef O_NOATIME
-        // skip atime updates for local files or root-owned access
         if (t->have_stat && (t->st.st_uid == geteuid() || geteuid() == 0))
             oflags |= O_NOATIME;
 #endif
@@ -1037,8 +975,7 @@ static void* worker_main(void* arg) {
         if (fd < 0) {
             rc = -1;
             saved_errno = errno;
-        }
-        else {
+        } else {
             struct stat st_local;
             const struct stat* stp = t->have_stat ? &t->st : NULL;
 
@@ -1054,8 +991,7 @@ static void* worker_main(void* arg) {
             if (rc == 0 && stp) {
                 if (S_ISREG(stp->st_mode)) {
                     rc = hash_regular_file_parallel(opts, name, fd, stp, out);
-                }
-                else {
+                } else {
                     rc = hash_fd_stream_fast(fd, stp->st_size, out);
                 }
                 if (rc != 0)
@@ -1071,14 +1007,12 @@ static void* worker_main(void* arg) {
             if (ok) {
                 if (!opts->quiet && !opts->status)
                     printf("%s: OK\n", name);
-            }
-            else {
+            } else {
                 any_failure_global = 1;
                 if (!opts->status)
                     printf("%s: FAILED\n", name);
             }
-        }
-        else {
+        } else {
             if (rc == 0 && !opts->status)
                 print_hash(out, name, opts->tag, opts->zero);
             else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
@@ -1096,8 +1030,9 @@ static void* worker_main(void* arg) {
     return NULL;
 }
 
-// run_pool_and_wait
-// spawns a worker pool, waits for completion, and joins all threads
+/* run_pool_and_wait
+   Spawns workers and waits for completion
+   Threads are joined before returning */
 static void run_pool_and_wait(const program_opts* opts) {
     int nthreads = opts->jobs > 0 ? opts->jobs : get_nprocs();
     if (nthreads < 1)
@@ -1126,8 +1061,6 @@ static void run_pool_and_wait(const program_opts* opts) {
     free(threads);
 }
 
-/* ──────────────── checksum verification (–-check mode) ──────────────── */
-
 static int process_check_files_multithread(int fc, char** files, const program_opts* opts) {
     atomic_store_explicit(&done_submitting_tasks, 0, memory_order_release);
 
@@ -1135,7 +1068,6 @@ static int process_check_files_multithread(int fc, char** files, const program_o
     size_t len = 0;
 
     if (fc == 0) {
-        // read from stdin
         while (getline(&line, &len, stdin) != -1) {
             char* fname = NULL;
             uint8_t expected[BLAKE3_OUT_LEN];
@@ -1149,8 +1081,7 @@ static int process_check_files_multithread(int fc, char** files, const program_o
             enqueue_task_check(fname, expected);
             free(fname);
         }
-    }
-    else {
+    } else {
         for (int i = 0; i < fc; i++) {
             FILE* f = (strcmp(files[i], "-") == 0) ? stdin : fopen(files[i], "r");
             if (!f) {
@@ -1190,8 +1121,6 @@ static int process_check_files_multithread(int fc, char** files, const program_o
     return (any_failure_global || (any_format_error_global && opts->strict)) ? 1 : 0;
 }
 
-/* ──────────────── file hashing producer ──────────────── */
-
 typedef struct {
     const program_opts* opts;
     int filec;
@@ -1216,8 +1145,6 @@ static void* producer_thread_main(void* arg) {
     return NULL;
 }
 
-/* ──────────────── main ──────────────── */
-
 int main(int argc, char** argv) {
     program_opts opts;
     int argi = handle_options(argc, argv, &opts);
@@ -1234,7 +1161,6 @@ int main(int argc, char** argv) {
         return r ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
-    // default: hash mode
     if (fc == 0) {
         static char* stdin_only[] = {"-"};
         files = stdin_only;
