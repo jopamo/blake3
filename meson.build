@@ -160,6 +160,36 @@ test_parallel = executable(
 )
 test('parallel_hashing', test_parallel)
 
+test_vectors = executable(
+  'test_vectors',
+  ['tests/test_vectors.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('vectors', test_vectors)
+
+test_streaming = executable(
+  'test_streaming',
+  ['tests/test_streaming.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('streaming', test_streaming)
+
+test_keyed = executable(
+  'test_keyed',
+  ['tests/test_keyed.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('keyed', test_keyed)
+
+test('cli',
+  find_program('tests/test_cli.sh'),
+  depends: [b3sum_exe],
+  env: ['MESON_BUILD_ROOT=' + meson.current_build_dir()]
+)
+
 summary({
   'SIMD compile args': simd_args,
   'BLAKE3 source files': blake3_sources,
