@@ -45,6 +45,14 @@ static b3_cv_bytes_t* ensure_tls_cv_buffer(size_t count) {
     return g_tls_cv_buf;
 }
 
+void b3p_free_tls_resources(void) {
+    if (g_tls_cv_buf) {
+        free(g_tls_cv_buf);
+        g_tls_cv_buf = NULL;
+        g_tls_cv_cap = 0;
+    }
+}
+
 /* Worker pool structures
    Simple bounded queue plus taskgroup counter
    Intended to keep scheduling overhead negligible relative to hashing work */
