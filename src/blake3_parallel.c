@@ -120,14 +120,15 @@ static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs);
 
 static b3p_method_t b3p_pick_heuristic(struct b3p_ctx *ctx);
 
-static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
-static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
-static void b3p_reduce_stack(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, size_t subtree_chunks, b3_cv_bytes_t *out_root, int is_final);
+static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root, b3_cv_bytes_t *out_split_children);
+static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root, b3_cv_bytes_t *out_split_children);
+static void b3p_reduce_stack(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, size_t subtree_chunks, b3_cv_bytes_t *out_root, int is_final, b3_cv_bytes_t *out_split_children);
 
 static int b3p_compute_root(
   struct b3p_ctx *ctx,
   b3p_method_t method,
   b3_cv_bytes_t *out_root,
+  b3_cv_bytes_t *out_split_children,
   uint64_t *out_ns
 );
 
@@ -241,14 +242,32 @@ int b3p_hash_one_shot_seek(
     chosen = b3p_pick_heuristic(ctx);
   }
 
+  /* For single chunk inputs, compute directly to support XOF/Seek on the root block */
+  if (ctx->num_chunks == 1) {
+      blake3_chunk_state state;
+      chunk_state_init(&state, ctx->kf.key, ctx->kf.flags);
+      state.chunk_counter = 0;
+      chunk_state_update(&state, ctx->input, ctx->input_len);
+      output_t output = chunk_state_output(&state);
+      /* Use internal impl for output_root_bytes to avoid including blake3.c content */
+      b3_output_root_impl(output.input_cv, output.flags, output.block, output.block_len, output.counter, seek, out, out_len);
+      return 0;
+  }
+
   b3_cv_bytes_t root = {0};
+  b3_cv_bytes_t split_children[2];
   uint64_t ns = 0;
-  int rc = b3p_compute_root(ctx, chosen, &root, &ns);
+  int rc = b3p_compute_root(ctx, chosen, &root, split_children, &ns);
   if (rc != 0)
     return rc;
 
-  /* Root output uses the implementation primitive directly to avoid wrappers */
-  b3_output_root_impl(ctx->kf.key, ctx->kf.flags, root.bytes, seek, out, out_len);
+  /* For multi-chunk inputs, the root is a PARENT node formed by split_children */
+  /* Reconstruct the root parent block to support XOF */
+  uint8_t root_block[BLAKE3_BLOCK_LEN];
+  memcpy(root_block, split_children[0].bytes, 32);
+  memcpy(root_block + 32, split_children[1].bytes, 32);
+
+  b3_output_root_impl(ctx->kf.key, ctx->kf.flags | PARENT, root_block, BLAKE3_BLOCK_LEN, 0, seek, out, out_len);
   return 0;
 }
 
@@ -476,7 +495,8 @@ static inline void b3p_hash_range_to_root(
   size_t chunk_end,
   b3_cv_bytes_t *restrict tmp,
   b3_cv_bytes_t *restrict out_root,
-  int is_root
+  int is_root,
+  b3_cv_bytes_t *out_split_children
 );
 
 typedef struct {
@@ -485,6 +505,7 @@ typedef struct {
   size_t end_chunk;
   size_t batch_step;
   b3_cv_bytes_t *out_cvs;
+  b3_cv_bytes_t *out_split_children;
 } b3p_chunks_job_t;
 
 typedef struct {
@@ -493,6 +514,7 @@ typedef struct {
   atomic_size_t next_subtree;
   size_t num_subtrees;
   b3_cv_bytes_t *out_subtree_cvs;
+  b3_cv_bytes_t *out_split_children;
 } b3p_subtrees_job_t;
 
 /* Chunk mode
@@ -520,7 +542,7 @@ static void b3p_task_hash_chunks(void *arg) {
        Passing is_root through ensures correct ROOT handling for tiny inputs */
     int is_root = (batch_start == 0 && batch_limit == ctx->num_chunks);
 
-    b3p_hash_range_to_root(ctx, batch_start, batch_limit, local_buf, &job->out_cvs[batch_idx], is_root);
+    b3p_hash_range_to_root(ctx, batch_start, batch_limit, local_buf, &job->out_cvs[batch_idx], is_root, (is_root ? job->out_split_children : NULL));
   }
 }
 
@@ -533,7 +555,8 @@ static inline void b3p_hash_range_to_root(
   size_t chunk_end,
   b3_cv_bytes_t *restrict tmp,
   b3_cv_bytes_t *restrict out_root,
-  int is_root
+  int is_root,
+  b3_cv_bytes_t *out_split_children
 ) {
   size_t n = chunk_end - chunk_start;
 
@@ -598,7 +621,7 @@ static inline void b3p_hash_range_to_root(
       input_ptr += count * (size_t)BLAKE3_CHUNK_LEN;
   }
 
-  b3p_reduce_stack(ctx, tmp, n, 1, out_root, is_root);
+  b3p_reduce_stack(ctx, tmp, n, 1, out_root, is_root, out_split_children);
 }
 
 /* Subtree mode
@@ -625,7 +648,7 @@ static void b3p_task_hash_subtrees(void *arg) {
 
     b3_cv_bytes_t root = {0};
     int is_root = (job->num_subtrees == 1);
-    b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root);
+    b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root, (is_root ? job->out_split_children : NULL));
     job->out_subtree_cvs[s] = root;
   }
 }
@@ -654,7 +677,8 @@ static void b3p_reduce_stack(
     size_t n,
     size_t subtree_chunks,
     b3_cv_bytes_t *restrict out_root,
-    int is_final
+    int is_final,
+    b3_cv_bytes_t *out_split_children
 ) {
   size_t stack_counts[64];
   size_t top = 0;
@@ -690,6 +714,12 @@ static void b3p_reduce_stack(
          size_t new_count = stack_counts[left_idx] + stack_counts[right_idx];
          int is_root = (is_final && new_count == total_count);
 
+         if (is_root && out_split_children) {
+             out_split_children[0] = cvs[left_idx];
+             out_split_children[1] = cvs[right_idx];
+             return;
+         }
+
          b3p_merge_nodes(ctx->kf.key, ctx->kf.flags,
                          &cvs[left_idx], &cvs[right_idx],
                          &cvs[left_idx], is_root);
@@ -709,6 +739,12 @@ static void b3p_reduce_stack(
      size_t new_count = stack_counts[left_idx] + stack_counts[right_idx];
      int is_root = (is_final && new_count == total_count);
 
+     if (is_root && out_split_children) {
+         out_split_children[0] = cvs[left_idx];
+         out_split_children[1] = cvs[right_idx];
+         return;
+     }
+
      b3p_merge_nodes(ctx->kf.key, ctx->kf.flags,
                      &cvs[left_idx], &cvs[right_idx],
                      &cvs[left_idx], is_root);
@@ -723,7 +759,7 @@ static void b3p_reduce_stack(
 /* Method A
    Chunk batching hashes contiguous ranges and reduces each batch into a CV
    Final merge reduces the batch roots into the tree root */
-static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
+static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root, b3_cv_bytes_t *out_split_children) {
   size_t simd_degree = blake3_simd_degree();
   if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
 
@@ -741,27 +777,33 @@ static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root)
     .next_chunk = 0,
     .end_chunk = ctx->num_chunks,
     .batch_step = batch_step,
-    .out_cvs = ctx->scratch_cvs
+    .out_cvs = ctx->scratch_cvs,
+    .out_split_children = out_split_children
   };
 
   b3p_taskgroup_t g;
   b3p_taskgroup_init(&g);
 
   size_t tasks = ctx->cfg.nthreads ? ctx->cfg.nthreads : 1;
-  for (size_t t = 0; t < tasks; t++)
-    b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_chunks, &job);
+  /* Optimization: if only 1 batch, run on main thread to ensure split children are written to stack */
+  if (num_batches == 1) {
+      b3p_task_hash_chunks(&job);
+  } else {
+      for (size_t t = 0; t < tasks; t++)
+        b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_chunks, &job);
 
-  b3p_taskgroup_wait(&g);
+      b3p_taskgroup_wait(&g);
+  }
   b3p_taskgroup_destroy(&g);
 
-  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_batches, batch_step, out_root, 1);
+  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_batches, batch_step, out_root, 1, out_split_children);
   return 0;
 }
 
 /* Method B
    Subtree batching hashes fixed-size subtrees per task
    Final merge reduces subtree roots into the tree root */
-static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
+static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root, b3_cv_bytes_t *out_split_children) {
   size_t subtree_chunks = ctx->cfg.subtree_chunks;
   if (subtree_chunks == 0) {
     subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS;
@@ -780,25 +822,30 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_roo
     .subtree_chunks = subtree_chunks,
     .next_subtree = 0,
     .num_subtrees = num_subtrees,
-    .out_subtree_cvs = ctx->scratch_cvs
+    .out_subtree_cvs = ctx->scratch_cvs,
+    .out_split_children = out_split_children
   };
 
   b3p_taskgroup_t g;
   b3p_taskgroup_init(&g);
 
   size_t tasks = ctx->cfg.nthreads ? ctx->cfg.nthreads : 1;
-  for (size_t t = 0; t < tasks; t++)
-    b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_subtrees, &job);
+  if (num_subtrees == 1) {
+      b3p_task_hash_subtrees(&job);
+  } else {
+      for (size_t t = 0; t < tasks; t++)
+        b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_subtrees, &job);
 
-  b3p_taskgroup_wait(&g);
+      b3p_taskgroup_wait(&g);
+  }
 
-  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1);
+  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1, out_split_children);
   return 0;
 }
 
 /* Serial fallback for contexts created with nthreads <= 1
    Uses the same subtree partitioning logic without starting a worker pool */
-static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
+static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root, b3_cv_bytes_t *out_split_children) {
   size_t subtree_chunks = ctx->cfg.subtree_chunks;
   if (subtree_chunks == 0) {
     subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS;
@@ -822,11 +869,11 @@ static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
       chunk_end = ctx->num_chunks;
 
     b3_cv_bytes_t root = {0};
-    b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root);
+    b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root, is_root, (is_root ? out_split_children : NULL));
     ctx->scratch_cvs[s] = root;
   }
 
-  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1);
+  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1, out_split_children);
   return 0;
 }
 
@@ -836,18 +883,19 @@ static int b3p_compute_root(
   struct b3p_ctx *ctx,
   b3p_method_t method,
   b3_cv_bytes_t *out_root,
+  b3_cv_bytes_t *out_split_children,
   uint64_t *out_ns
 ) {
   if (ctx->pool.nthreads == 0) {
       *out_ns = 0;
-      return b3p_run_serial(ctx, out_root);
+      return b3p_run_serial(ctx, out_root, out_split_children);
   }
 
   int rc = 0;
   if (method == B3P_METHOD_A_CHUNKS)
-    rc = b3p_run_method_a_chunks(ctx, out_root);
+    rc = b3p_run_method_a_chunks(ctx, out_root, out_split_children);
   else if (method == B3P_METHOD_B_SUBTREES)
-    rc = b3p_run_method_b_subtrees(ctx, out_root);
+    rc = b3p_run_method_b_subtrees(ctx, out_root, out_split_children);
   else
     rc = -1;
 
@@ -884,12 +932,27 @@ int b3p_hash_buffer_serial(
   }
   ctx.kf.flags = flags;
 
+  if (ctx.num_chunks == 1) {
+      blake3_chunk_state state;
+      chunk_state_init(&state, ctx.kf.key, ctx.kf.flags);
+      state.chunk_counter = 0;
+      chunk_state_update(&state, ctx.input, ctx.input_len);
+      output_t output = chunk_state_output(&state);
+      b3_output_root_impl(output.input_cv, output.flags, output.block, output.block_len, output.counter, 0, out, out_len);
+      return 0;
+  }
+
   b3_cv_bytes_t *tmp = ensure_tls_cv_buffer(ctx.num_chunks);
   if (!tmp) return -1;
 
   b3_cv_bytes_t root = {0};
-  b3p_hash_range_to_root(&ctx, 0, ctx.num_chunks, tmp, &root, 1);
+  b3_cv_bytes_t split_children[2];
+  b3p_hash_range_to_root(&ctx, 0, ctx.num_chunks, tmp, &root, 1, split_children);
 
-  b3_output_root_impl(ctx.kf.key, ctx.kf.flags, root.bytes, 0, out, out_len);
+  uint8_t root_block[BLAKE3_BLOCK_LEN];
+  memcpy(root_block, split_children[0].bytes, 32);
+  memcpy(root_block + 32, split_children[1].bytes, 32);
+
+  b3_output_root_impl(ctx.kf.key, ctx.kf.flags | PARENT, root_block, BLAKE3_BLOCK_LEN, 0, 0, out, out_len);
   return 0;
 }
