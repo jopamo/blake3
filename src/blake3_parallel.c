@@ -1,6 +1,16 @@
 #define _GNU_SOURCE
 #include "blake3_parallel.h"
-#include "blake3_internal.h"
+#include "blake3_impl.h"
+
+/* Types previously defined in blake3_internal.h */
+typedef struct {
+  uint8_t bytes[32];
+} b3_cv_bytes_t;
+
+typedef struct {
+  uint32_t key[8];
+  uint8_t flags;
+} b3_keyed_flags_t;
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -10,6 +20,7 @@
 #include <unistd.h>
 #include <alloca.h>
 #include <stdio.h>
+#define DEBUG_PARALLEL 0
 
 /* ============================================================================
  * Worker pool data structures
@@ -47,25 +58,9 @@ typedef struct {
   b3p_taskq_t q;
 } b3p_pool_t;
 
-/* ============================================================================
- * Adaptive selection state (EWMA buckets)
- * ===========================================================================*/
 
-typedef struct {
-  atomic_uint have_a;
-  atomic_uint have_b;
-  atomic_uint_fast64_t ewma_a_q32;
-  atomic_uint_fast64_t ewma_b_q32;
-} b3p_tune_bucket_t;
 
-#define B3P_TUNE_BUCKETS 32
 
-typedef struct {
-  int enable;
-  uint32_t sample_mask;
-  atomic_uint_fast32_t rng;
-  b3p_tune_bucket_t buckets[B3P_TUNE_BUCKETS];
-} b3p_tuner_t;
 
 /* ============================================================================
  * Context object tying it all together
@@ -84,8 +79,6 @@ struct b3p_ctx {
   size_t scratch_cvs_cap;
 
   b3p_pool_t pool;
-  b3p_tuner_t tuner;
-
   b3p_config_t cfg;
 };
 
@@ -101,22 +94,14 @@ static int b3p_pool_submit(b3p_pool_t *p, b3p_taskgroup_t *g, b3p_task_fn fn, vo
 static void b3p_taskgroup_wait(b3p_taskgroup_t *g);
 static void *b3p_worker_main(void *arg);
 
-static uint32_t b3p_bucket_for_chunks(size_t num_chunks);
-static uint64_t b3p_q32_from_ratio(double x);
-static uint64_t b3p_ewma_update_q32(uint64_t old_q32, uint64_t sample_q32);
-static uint32_t b3p_rng_next(atomic_uint_fast32_t *s);
-static int b3p_should_sample(struct b3p_ctx *ctx);
-static uint64_t b3p_now_ns(void);
-static void b3p_tuner_update(struct b3p_ctx *ctx, b3p_method_t m, uint64_t ns, size_t bytes);
 
 static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs);
 
 static b3p_method_t b3p_pick_heuristic(struct b3p_ctx *ctx);
-static b3p_method_t b3p_pick_with_tuner(struct b3p_ctx *ctx, b3p_method_t fallback);
 
-static int b3p_run_method_a(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
-static int b3p_run_method_b(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
-static void b3p_reduce_in_place(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, b3_cv_bytes_t *out_root);
+static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
+static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
+static void b3p_reduce_in_place(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, b3_cv_bytes_t *out_root, int is_final);
 
 static int b3p_compute_root(
   struct b3p_ctx *ctx,
@@ -149,12 +134,6 @@ b3p_ctx_t *b3p_create(const b3p_config_t *cfg) {
   if (!ctx) return NULL;
 
   ctx->cfg = *cfg;
-  // Initialize tuner
-  ctx->tuner.enable = cfg->autotune_enable;
-  ctx->tuner.sample_mask = cfg->autotune_sample_mask;
-  ctx->tuner.rng = (uint32_t)b3p_now_ns();
-  // buckets are zero-initialized by calloc
-
   // Initialize worker pool
   size_t nthreads = cfg->nthreads;
   size_t qcap = 256; // default queue capacity
@@ -219,11 +198,21 @@ int b3p_hash_one_shot_seek(
     ctx->kf.key[i] = w;
   }
   ctx->kf.flags = flags;
+#if DEBUG_PARALLEL
+  fprintf(stderr, "[parallel] key bytes: ");
+  for (int i = 0; i < BLAKE3_KEY_LEN; i++) {
+    fprintf(stderr, "%02x", key[i]);
+  }
+  fprintf(stderr, "\n[parallel] key words: ");
+  for (int i = 0; i < 8; i++) {
+    fprintf(stderr, "%08x ", ctx->kf.key[i]);
+  }
+  fprintf(stderr, "\n[parallel] flags: %02x\n", flags);
+#endif
 
   b3p_method_t chosen = method;
   if (method == B3P_METHOD_AUTO) {
-    b3p_method_t h = b3p_pick_heuristic(ctx);
-    chosen = b3p_pick_with_tuner(ctx, h);
+    chosen = b3p_pick_heuristic(ctx);
   }
 
   b3_cv_bytes_t root = {0};
@@ -232,10 +221,8 @@ int b3p_hash_one_shot_seek(
   if (rc != 0)
     return rc;
 
-  if (ns)
-    b3p_tuner_update(ctx, chosen, ns, input_len);
 
-  b3_output_root(&ctx->kf, &root, seek, out, out_len);
+  b3_output_root_impl(ctx->kf.key, ctx->kf.flags, root.bytes, seek, out, out_len);
   return 0;
 }
 
@@ -401,89 +388,25 @@ static void *b3p_worker_main(void *arg) {
   return NULL;
 }
 
-/* ============================================================================
- * Tuner implementation
- * ===========================================================================*/
 
-static uint32_t b3p_bucket_for_chunks(size_t num_chunks) {
-  uint32_t b = 0;
-  size_t v = num_chunks;
-  while (v > 1 && b + 1 < B3P_TUNE_BUCKETS) {
-    v >>= 1;
-    b++;
-  }
-  return b;
-}
 
-static uint64_t b3p_q32_from_ratio(double x) {
-  return (uint64_t)(x * (double)(1ULL << 32));
-}
 
-static uint64_t b3p_ewma_update_q32(uint64_t old_q32, uint64_t sample_q32) {
-  uint64_t alpha_num = 1;
-  uint64_t alpha_den = 8;
-  uint64_t keep = (alpha_den - alpha_num);
-  return (old_q32 * keep + sample_q32 * alpha_num) / alpha_den;
-}
 
-static uint32_t b3p_rng_next(atomic_uint_fast32_t *s) {
-  uint32_t x = atomic_load_explicit(s, memory_order_relaxed);
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  atomic_store_explicit(s, x, memory_order_relaxed);
-  return x;
-}
 
-static int b3p_should_sample(struct b3p_ctx *ctx) {
-  if (!ctx->tuner.enable)
-    return 0;
-  uint32_t r = b3p_rng_next(&ctx->tuner.rng);
-  return (r & ctx->tuner.sample_mask) == 0;
-}
 
-static uint64_t b3p_now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
 
-static void b3p_tuner_update(struct b3p_ctx *ctx, b3p_method_t m, uint64_t ns, size_t bytes) {
-  if (!ctx->tuner.enable || bytes == 0)
-    return;
-
-  uint32_t bi = b3p_bucket_for_chunks(ctx->num_chunks);
-  b3p_tune_bucket_t *bk = &ctx->tuner.buckets[bi];
-
-  double ns_per_byte = (double)ns / (double)bytes;
-  uint64_t sample = b3p_q32_from_ratio(ns_per_byte);
-
-  if (m == B3P_METHOD_A_CHUNKS) {
-    uint64_t old = atomic_load_explicit(&bk->ewma_a_q32, memory_order_relaxed);
-    uint64_t neu = old ? b3p_ewma_update_q32(old, sample) : sample;
-    atomic_store_explicit(&bk->ewma_a_q32, neu, memory_order_relaxed);
-    atomic_store_explicit(&bk->have_a, 1, memory_order_relaxed);
-  } else if (m == B3P_METHOD_B_SUBTREES) {
-    uint64_t old = atomic_load_explicit(&bk->ewma_b_q32, memory_order_relaxed);
-    uint64_t neu = old ? b3p_ewma_update_q32(old, sample) : sample;
-    atomic_store_explicit(&bk->ewma_b_q32, neu, memory_order_relaxed);
-    atomic_store_explicit(&bk->have_b, 1, memory_order_relaxed);
-  }
-}
 
 /* ============================================================================
  * Scratch management
  * ===========================================================================*/
 
 static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs) {
-  fprintf(stderr, "ensure_scratch: want=%zu cap=%zu\n", want_cvs, ctx->scratch_cvs_cap);
   if (want_cvs <= ctx->scratch_cvs_cap)
     return 0;
 
   size_t new_cap = ctx->scratch_cvs_cap ? ctx->scratch_cvs_cap : 1024;
   while (new_cap < want_cvs)
     new_cap *= 2;
-  fprintf(stderr, "  new_cap=%zu alloc=%zu\n", new_cap, new_cap * sizeof(b3_cv_bytes_t));
 
   void *p = realloc(ctx->scratch_cvs, new_cap * sizeof(b3_cv_bytes_t));
   if (!p)
@@ -491,7 +414,6 @@ static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs) {
 
   ctx->scratch_cvs = p;
   ctx->scratch_cvs_cap = new_cap;
-  fprintf(stderr, "  allocated\n");
   return 0;
 }
 
@@ -499,42 +421,29 @@ static int b3p_ensure_scratch(struct b3p_ctx *ctx, size_t want_cvs) {
  * Selection logic
  * ===========================================================================*/
 
+static inline size_t b3_min_sz(size_t a, size_t b) { return a < b ? a : b; }
+
+static inline size_t b3_full_chunks(size_t input_len) {
+  return input_len / (size_t)BLAKE3_CHUNK_LEN;
+}
+
 static b3p_method_t b3p_pick_heuristic(struct b3p_ctx *ctx) {
-  size_t eff_threads = ctx->cfg.nthreads ? ctx->cfg.nthreads : 1;
-  if (eff_threads <= 1)
-    return B3P_METHOD_A_CHUNKS;
+  if (ctx->pool.nthreads < 2) return B3P_METHOD_A_CHUNKS;
 
-  if (ctx->input_len < ctx->cfg.min_parallel_bytes)
-    return B3P_METHOD_A_CHUNKS;
+  if (ctx->input_len < ctx->cfg.min_parallel_bytes) return B3P_METHOD_A_CHUNKS;
 
-  if (ctx->num_chunks < ctx->cfg.method_a_min_chunks)
-    return B3P_METHOD_A_CHUNKS;
+  size_t chunks = b3_full_chunks(ctx->input_len);
+  if (chunks < ctx->cfg.method_a_min_chunks) return B3P_METHOD_A_CHUNKS;
 
-  size_t need = ctx->cfg.method_b_min_chunks_per_thread * eff_threads;
-  if (ctx->num_chunks >= need)
-    return B3P_METHOD_B_SUBTREES;
+  size_t simd = blake3_simd_degree();
+  size_t effective_lane = b3_min_sz(simd, (size_t)MAX_SIMD_DEGREE);
+
+  size_t chunks_per_thread_floor = 128 * effective_lane;
+  if (chunks >= ctx->pool.nthreads * chunks_per_thread_floor) return B3P_METHOD_B_SUBTREES;
 
   return B3P_METHOD_A_CHUNKS;
 }
 
-static b3p_method_t b3p_pick_with_tuner(struct b3p_ctx *ctx, b3p_method_t fallback) {
-  if (!ctx->tuner.enable)
-    return fallback;
-
-  uint32_t b = b3p_bucket_for_chunks(ctx->num_chunks);
-  b3p_tune_bucket_t *bk = &ctx->tuner.buckets[b];
-
-  unsigned ha = atomic_load_explicit(&bk->have_a, memory_order_relaxed);
-  unsigned hb = atomic_load_explicit(&bk->have_b, memory_order_relaxed);
-
-  if (!ha || !hb)
-    return fallback;
-
-  uint64_t a = atomic_load_explicit(&bk->ewma_a_q32, memory_order_relaxed);
-  uint64_t bq = atomic_load_explicit(&bk->ewma_b_q32, memory_order_relaxed);
-
-  return (bq < a) ? B3P_METHOD_B_SUBTREES : B3P_METHOD_A_CHUNKS;
-}
 
 /* ============================================================================
  * Method implementations
@@ -559,16 +468,66 @@ static void b3p_task_hash_chunks(void *arg) {
   b3p_chunks_job_t *job = arg;
   struct b3p_ctx *ctx = job->ctx;
 
+  size_t simd_degree = blake3_simd_degree();
+  if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
+
+  // Process larger batches to reduce atomic contention
+  size_t batch_step = simd_degree * 64; 
+
   for (;;) {
-    size_t i = atomic_fetch_add_explicit(&job->next_chunk, 1, memory_order_relaxed);
-    if (i >= job->end_chunk)
+    size_t batch_start = atomic_fetch_add_explicit(&job->next_chunk, batch_step, memory_order_relaxed);
+    if (batch_start >= job->end_chunk)
       break;
 
-    size_t off = i * (size_t)BLAKE3_CHUNK_LEN;
-    size_t remain = ctx->input_len - off;
-    size_t clen = remain < (size_t)BLAKE3_CHUNK_LEN ? remain : (size_t)BLAKE3_CHUNK_LEN;
+    size_t batch_limit = batch_start + batch_step;
+    if (batch_limit > job->end_chunk) batch_limit = job->end_chunk;
 
-    b3_hash_chunk_cv(&ctx->kf, ctx->input + off, clen, (uint64_t)i, &job->out_cvs[i]);
+    size_t i = batch_start;
+    const uint8_t *input_ptr = ctx->input + i * (size_t)BLAKE3_CHUNK_LEN;
+
+    while (i < batch_limit) {
+        size_t count = simd_degree;
+        if (i + count > batch_limit)
+          count = batch_limit - i;
+
+        size_t full_count = count;
+        // Only the very last chunk of the entire input might be partial.
+        if (i + count == ctx->num_chunks) {
+          size_t off = (ctx->num_chunks - 1) * (size_t)BLAKE3_CHUNK_LEN;
+          if (ctx->input_len - off < (size_t)BLAKE3_CHUNK_LEN) {
+            full_count--;
+          }
+        }
+
+        if (full_count > 0) {
+          const uint8_t *inputs[MAX_SIMD_DEGREE];
+          for (size_t j = 0; j < full_count; j++) {
+            inputs[j] = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
+          }
+          uint8_t flags_common = ctx->kf.flags;
+          uint8_t flags_end = CHUNK_END;
+          if (ctx->num_chunks == 1) {
+             flags_end |= ROOT;
+          }
+          
+          blake3_hash_many(inputs, full_count, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN,
+                           ctx->kf.key, (uint64_t)i, true, flags_common, CHUNK_START, flags_end,
+                           job->out_cvs[i].bytes);
+        }
+
+        if (full_count < count) {
+          size_t j = full_count;
+          size_t idx = i + j;
+          const uint8_t *partial_ptr = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
+          size_t off = idx * (size_t)BLAKE3_CHUNK_LEN;
+          size_t remain = ctx->input_len - off;
+          size_t clen = remain < (size_t)BLAKE3_CHUNK_LEN ? remain : (size_t)BLAKE3_CHUNK_LEN;
+          b3_hash_chunk_cv_impl(ctx->kf.key, ctx->kf.flags, partial_ptr, clen, (uint64_t)idx, (ctx->num_chunks == 1), job->out_cvs[idx].bytes);
+        }
+        
+        i += count;
+        input_ptr += count * (size_t)BLAKE3_CHUNK_LEN;
+    }
   }
 }
 
@@ -580,49 +539,122 @@ static void b3p_hash_range_to_root(
   b3_cv_bytes_t *out_root
 ) {
   size_t n = chunk_end - chunk_start;
+#if DEBUG_PARALLEL
+  fprintf(stderr, "[parallel] hash_range_to_root: chunk_start=%zu chunk_end=%zu n=%zu\n", chunk_start, chunk_end, n);
+#endif
 
-  for (size_t i = 0; i < n; i++) {
-    size_t chunk_i = chunk_start + i;
-    size_t off = chunk_i * (size_t)BLAKE3_CHUNK_LEN;
-    size_t remain = ctx->input_len - off;
-    size_t clen = remain < (size_t)BLAKE3_CHUNK_LEN ? remain : (size_t)BLAKE3_CHUNK_LEN;
+  size_t simd_degree = blake3_simd_degree();
+  if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
 
-    b3_hash_chunk_cv(&ctx->kf, ctx->input + off, clen, (uint64_t)chunk_i, &tmp[i]);
+  const uint8_t *input_ptr = ctx->input + chunk_start * (size_t)BLAKE3_CHUNK_LEN;
+
+  size_t i = 0;
+  while (i < n) {
+      size_t count = simd_degree;
+      if (i + count > n) count = n - i;
+
+      size_t full_count = count;
+      if (chunk_start + i + count == ctx->num_chunks) {
+        size_t off = (ctx->num_chunks - 1) * (size_t)BLAKE3_CHUNK_LEN;
+        if (ctx->input_len - off < (size_t)BLAKE3_CHUNK_LEN) {
+             full_count--;
+        }
+      }
+
+      if (full_count > 0) {
+          const uint8_t *inputs[MAX_SIMD_DEGREE];
+          for (size_t j = 0; j < full_count; j++) {
+              inputs[j] = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
+          }
+          blake3_hash_many(inputs, full_count, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN,
+                           ctx->kf.key, (uint64_t)(chunk_start + i), true, ctx->kf.flags, CHUNK_START, CHUNK_END,
+                           tmp[i].bytes);
+      }
+
+      if (full_count < count) {
+          size_t j = full_count;
+          size_t chunk_i = chunk_start + i + j;
+          const uint8_t *partial_chunk_ptr = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
+          
+          size_t off = chunk_i * (size_t)BLAKE3_CHUNK_LEN;
+          size_t remain = ctx->input_len - off;
+          size_t clen = remain < (size_t)BLAKE3_CHUNK_LEN ? remain : (size_t)BLAKE3_CHUNK_LEN;
+          b3_hash_chunk_cv_impl(ctx->kf.key, ctx->kf.flags, partial_chunk_ptr, clen, (uint64_t)chunk_i, false, tmp[i + j].bytes);
+      }
+      i += count;
+      input_ptr += count * (size_t)BLAKE3_CHUNK_LEN;
   }
 
-  b3p_reduce_in_place(ctx, tmp, n, out_root);
+  b3p_reduce_in_place(ctx, tmp, n, out_root, 0);
 }
 
 static void b3p_task_hash_subtrees(void *arg) {
+#if DEBUG_PARALLEL
+  fprintf(stderr, "[parallel] task_hash_subtrees start\n");
+#endif
   b3p_subtrees_job_t *job = arg;
   struct b3p_ctx *ctx = job->ctx;
 
   size_t max_tmp = job->subtree_chunks;
+#if DEBUG_PARALLEL
+  fprintf(stderr, "[parallel] max_tmp=%zu\n", max_tmp);
+#endif
   b3_cv_bytes_t *tmp = (b3_cv_bytes_t*)alloca(max_tmp * sizeof(b3_cv_bytes_t));
 
   for (;;) {
     size_t s = atomic_fetch_add_explicit(&job->next_subtree, 1, memory_order_relaxed);
     if (s >= job->num_subtrees)
       break;
-
+#if DEBUG_PARALLEL
+    fprintf(stderr, "[parallel] subtree s=%zu\n", s);
+#endif
     size_t chunk_start = s * job->subtree_chunks;
     size_t chunk_end = chunk_start + job->subtree_chunks;
     if (chunk_end > ctx->num_chunks)
       chunk_end = ctx->num_chunks;
-
+#if DEBUG_PARALLEL
+    fprintf(stderr, "[parallel] chunk_start=%zu chunk_end=%zu\n", chunk_start, chunk_end);
+#endif
     b3_cv_bytes_t root = {0};
     b3p_hash_range_to_root(ctx, chunk_start, chunk_end, tmp, &root);
     job->out_subtree_cvs[s] = root;
   }
 }
 
-static void b3p_reduce_in_place(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, b3_cv_bytes_t *out_root) {
+static void b3p_reduce_in_place(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, b3_cv_bytes_t *out_root, int is_final) {
   while (n > 1) {
     size_t parents = 0;
     size_t i = 0;
 
+    size_t simd_degree = blake3_simd_degree();
+    if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
+
+    while (i + 2 * simd_degree <= n) {
+        const uint8_t *inputs[MAX_SIMD_DEGREE];
+
+        for (size_t j = 0; j < simd_degree; j++) {
+            // The left and right CVs are contiguous in memory.
+            // cvs[k] is 32 bytes. cvs[k+1] is the next 32 bytes.
+            // So &cvs[i + 2*j] points to the start of the 64-byte parent block.
+            inputs[j] = cvs[i + 2 * j].bytes;
+        }
+
+        uint8_t flags = ctx->kf.flags | PARENT;
+        if (is_final && n == 2) flags |= ROOT;
+
+        blake3_hash_many(inputs, simd_degree, 1, ctx->kf.key, 0, false, flags, 0, 0,
+                         cvs[parents].bytes);
+        
+        i += 2 * simd_degree;
+        parents += simd_degree;
+    }
+
     for (; i + 1 < n; i += 2) {
-      b3_hash_parent_cv(&ctx->kf, &cvs[i], &cvs[i + 1], &cvs[parents]);
+      uint8_t flags = ctx->kf.flags | PARENT;
+      if (is_final && n == 2) {
+          flags |= ROOT;
+      }
+      b3_hash_parent_cv_impl(ctx->kf.key, flags, cvs[i].bytes, cvs[i + 1].bytes, cvs[parents].bytes);
       parents++;
     }
 
@@ -637,8 +669,7 @@ static void b3p_reduce_in_place(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t 
   *out_root = cvs[0];
 }
 
-static int b3p_run_method_a(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
-  fprintf(stderr, "run_method_a: num_chunks=%zu\n", ctx->num_chunks);
+static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
   if (b3p_ensure_scratch(ctx, ctx->num_chunks) != 0)
     return -1;
 
@@ -659,13 +690,19 @@ static int b3p_run_method_a(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
   b3p_taskgroup_wait(&g);
   b3p_taskgroup_destroy(&g);
 
-  b3p_reduce_in_place(ctx, ctx->scratch_cvs, ctx->num_chunks, out_root);
+  b3p_reduce_in_place(ctx, ctx->scratch_cvs, ctx->num_chunks, out_root, 1);
   return 0;
 }
 
-static int b3p_run_method_b(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
+static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
+#if DEBUG_PARALLEL
+  fprintf(stderr, "[parallel] method B: input_len=%zu num_chunks=%zu nthreads=%zu\n", ctx->input_len, ctx->num_chunks, ctx->pool.nthreads);
+#endif
   size_t subtree_chunks = ctx->cfg.subtree_chunks ? ctx->cfg.subtree_chunks : B3P_DEFAULT_SUBTREE_CHUNKS;
   size_t num_subtrees = (ctx->num_chunks + subtree_chunks - 1) / subtree_chunks;
+#if DEBUG_PARALLEL
+  fprintf(stderr, "[parallel] subtree_chunks=%zu num_subtrees=%zu\n", subtree_chunks, num_subtrees);
+#endif
 
   if (b3p_ensure_scratch(ctx, num_subtrees) != 0)
     return -1;
@@ -688,7 +725,7 @@ static int b3p_run_method_b(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
   b3p_taskgroup_wait(&g);
   b3p_taskgroup_destroy(&g);
 
-  b3p_reduce_in_place(ctx, ctx->scratch_cvs, num_subtrees, out_root);
+  b3p_reduce_in_place(ctx, ctx->scratch_cvs, num_subtrees, out_root, 1);
   return 0;
 }
 
@@ -702,23 +739,14 @@ static int b3p_compute_root(
   b3_cv_bytes_t *out_root,
   uint64_t *out_ns
 ) {
-  int sample = b3p_should_sample(ctx);
-  uint64_t t0 = sample ? b3p_now_ns() : 0;
-
   int rc = 0;
   if (method == B3P_METHOD_A_CHUNKS)
-    rc = b3p_run_method_a(ctx, out_root);
+    rc = b3p_run_method_a_chunks(ctx, out_root);
   else if (method == B3P_METHOD_B_SUBTREES)
-    rc = b3p_run_method_b(ctx, out_root);
+    rc = b3p_run_method_b_subtrees(ctx, out_root);
   else
     rc = -1;
 
-  if (sample) {
-    uint64_t t1 = b3p_now_ns();
-    *out_ns = (rc == 0) ? (t1 - t0) : 0;
-  } else {
-    *out_ns = 0;
-  }
-
+  *out_ns = 0;
   return rc;
 }
