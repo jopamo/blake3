@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define B3P_DEFAULT_SUBTREE_CHUNKS 32
+#define B3P_DEFAULT_SUBTREE_CHUNKS 4096
 
 typedef enum {
   B3P_METHOD_AUTO = 0,

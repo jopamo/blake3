@@ -233,7 +233,7 @@ BLAKE3_PRIVATE size_t blake3_compress_subtree_wide(const uint8_t* input, size_t 
 /* Internal primitives for parallel hashing */
 BLAKE3_PRIVATE void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags,
                                      const uint8_t *chunk, size_t chunk_len,
-                                     uint64_t chunk_index, uint8_t out_cv[32]);
+                                     uint64_t chunk_index, bool is_root, uint8_t out_cv[32]);
 BLAKE3_PRIVATE void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags,
                                       const uint8_t left_cv[32], const uint8_t right_cv[32],
                                       uint8_t out_cv[32]);

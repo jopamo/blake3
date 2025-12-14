@@ -24,6 +24,7 @@ b3sum:
 #include <unistd.h>
 
 #include "blake3.h"
+#include "blake3_parallel.h"
 #include "blake3_impl.h"
 
 #if defined(__linux__)
@@ -60,19 +61,12 @@ b3sum:
 static __thread uint8_t* tls_io_buf = NULL;
 static __thread size_t tls_io_buf_cap = 0;
 
-/* thread local output batching */
-#define OUTPUT_BATCH_BUF_SIZE (64 * 1024)  /* 64KB per thread */
-static __thread char* tls_out_buf = NULL;
-static __thread size_t tls_out_buf_pos = 0;
 static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;  // serialize stdout
 
 /* --- forward declarations --- */
 static int blake3_hash_region_tree(const uint8_t* data, size_t len, uint8_t out_hash[BLAKE3_OUT_LEN]);
 
 /* --- tls buffer helpers --- */
-static inline size_t align_up(size_t value, size_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
 
 // ensure_tls_io_buffer
 // ensures the thread-local I/O buffer is at least min_bytes large
@@ -123,38 +117,7 @@ static void release_tls_io_buffer(void) {
     tls_io_buf_cap = 0;
 }
 
-// ensure_tls_out_buffer
-// ensures the thread-local output buffer is allocated
-// returns pointer to buffer or NULL on allocation failure
-static char* ensure_tls_out_buffer(void) {
-    if (!tls_out_buf) {
-        tls_out_buf = malloc(OUTPUT_BATCH_BUF_SIZE);
-        if (!tls_out_buf)
-            return NULL;
-        tls_out_buf_pos = 0;
-    }
-    return tls_out_buf;
-}
 
-// flush_tls_out_buffer
-// writes buffered output to stdout under output mutex
-static void flush_tls_out_buffer(void) {
-    if (tls_out_buf && tls_out_buf_pos > 0) {
-        pthread_mutex_lock(&output_mutex);
-        fwrite(tls_out_buf, 1, tls_out_buf_pos, stdout);
-        pthread_mutex_unlock(&output_mutex);
-        tls_out_buf_pos = 0;
-    }
-}
-
-// release_tls_out_buffer
-// frees the thread-local output buffer
-static void release_tls_out_buffer(void) {
-    flush_tls_out_buffer();
-    free(tls_out_buf);
-    tls_out_buf = NULL;
-    tls_out_buf_pos = 0;
-}
 
 /* ──────────────── program options ────────────────
    holds parsed CLI flags and operational modes
@@ -210,9 +173,8 @@ static _Atomic int done_submitting_tasks = 0;
 static int any_failure_global = 0;
 static int any_format_error_global = 0;
 
-/* ──────────────── per-file parallel hashing ────────────────
-   manages helper threads hashing different chunk ranges of a file
-   avoids redundant mmap/fstat overhead between threads
+/* ──────────────── per-file context ────────────────
+   holds file state for hashing (mmap, size, etc.)
 */
 typedef struct {
     int fd;                     // open file descriptor
@@ -220,401 +182,27 @@ typedef struct {
     const uint8_t* map;         // memory-mapped region (if used)
     size_t map_len;             // length of mapped region
     size_t total_chunks;        // ceil(size / BLAKE3_CHUNK_LEN)
-    uint8_t* cvs;               // per-chunk chaining values
-    _Atomic size_t next_chunk;  // atomic cursor for work stealing
-    size_t chunks_per_job;      // chunk batch size per helper
     _Atomic int had_error;      // nonzero if any I/O or hash error
     int io_error_code;          // saved errno if had_error != 0
 } perfile_ctx;
 
-// forward declarations for file and memory chunk hashing
-static void hash_chunk_span_mem(perfile_ctx* ctx, size_t start_index, size_t span_count);
-static int hash_chunk_span_fd(perfile_ctx* ctx, size_t start_index, size_t span_count);
+// forward declarations
+static int hash_fd_stream_fast(int fd, off_t filesize, uint8_t* output);
 
-// per-thread helper argument structure
-typedef struct {
-    perfile_ctx* ctx;
-} perfile_worker_arg;
 
-/* ──────────────── chunk_len_for_index_pf ────────────────
-   returns number of bytes in a given chunk index within a file
-   last chunk may be partial
-*/
-static inline size_t chunk_len_for_index_pf(const perfile_ctx* c, size_t chunk_index) {
-    size_t offset = chunk_index * (size_t)BLAKE3_CHUNK_LEN;
-    if ((off_t)offset >= c->size)
-        return 0;
-    size_t remaining = (size_t)c->size - offset;
-    return remaining < BLAKE3_CHUNK_LEN ? remaining : BLAKE3_CHUNK_LEN;
-}
 
-// cv_from_chunk_bytes
-// computes the 32-byte chaining value (CV) for a single BLAKE3 chunk
-// mirrors leaf hashing logic: processes input in 64-byte blocks
-// applies CHUNK_START/CHUNK_END flags and chunk index as counter
-// output CV is used later by the tree hasher
-static void cv_from_chunk_bytes(const uint8_t* input, size_t len, uint64_t chunk_counter, uint8_t out_cv[BLAKE3_OUT_LEN]) {
-    uint32_t cv[8];
-    memcpy(cv, IV, sizeof(IV));
 
-    size_t offset = 0;
-    int first = 1;
 
-    // process all full 64-byte blocks except the last
-    while (len - offset > BLAKE3_BLOCK_LEN) {
-        blake3_compress_in_place(cv, input + offset, BLAKE3_BLOCK_LEN, chunk_counter, first ? CHUNK_START : 0);
-        first = 0;
-        offset += BLAKE3_BLOCK_LEN;
-    }
 
-    // prepare last block (possibly partial)
-    size_t tail_len = len - offset;
-    uint8_t block[BLAKE3_BLOCK_LEN];
-    const uint8_t* tail = input + offset;
 
-    if (tail_len != BLAKE3_BLOCK_LEN) {
-        memcpy(block, tail, tail_len);
-        if (tail_len < BLAKE3_BLOCK_LEN)
-            memset(block + tail_len, 0, BLAKE3_BLOCK_LEN - tail_len);
-        tail = block;
-    }
 
-    uint8_t flags = CHUNK_END | (first ? CHUNK_START : 0);
-    blake3_compress_in_place(cv, tail, (uint8_t)tail_len, chunk_counter, flags);
 
-    store_cv_words(out_cv, cv);
-}
 
-// hash_chunk_span_mem
-// hashes a contiguous span of chunks directly from mapped file memory
-// uses SIMD-parallel blake3_hash_many for full-width groups,
-// falling back to scalar cv_from_chunk_bytes for any trailing partial chunks
-// stores each 32-byte chaining value (CV) sequentially into ctx->cvs
-static void hash_chunk_span_mem(perfile_ctx* ctx, size_t start_index, size_t span_count) {
-    if (span_count == 0)
-        return;
-
-    const size_t simd = blake3_simd_degree() ?: 1;
-    const size_t chunk_len = BLAKE3_CHUNK_LEN;
-    const size_t blocks_per_chunk = chunk_len / BLAKE3_BLOCK_LEN;
-    const uint8_t* base = ctx->map;
-    const size_t total_size = (size_t)ctx->size;
-
-    const uint8_t* inputs[MAX_SIMD_DEGREE];
-    size_t idx = start_index;
-    size_t remain = span_count;
-
-    // process full SIMD-width groups
-    while (remain >= simd) {
-        for (size_t i = 0; i < simd; i++)
-            inputs[i] = base + (idx + i) * chunk_len;
-
-        blake3_hash_many(inputs, simd, blocks_per_chunk, IV, idx, true, 0, CHUNK_START, CHUNK_END, ctx->cvs + idx * BLAKE3_OUT_LEN);
-
-        idx += simd;
-        remain -= simd;
-    }
-
-    // handle tail chunks (not a full SIMD group)
-    while (remain--) {
-        size_t off = idx * chunk_len;
-        if (off >= total_size) {
-            memset(ctx->cvs + idx * BLAKE3_OUT_LEN, 0, BLAKE3_OUT_LEN);
-            idx++;
-            continue;
-        }
-
-        size_t len = total_size - off;
-        if (len >= chunk_len) {
-            inputs[0] = base + off;
-            blake3_hash_many(inputs, 1, blocks_per_chunk, IV, idx, true, 0, CHUNK_START, CHUNK_END, ctx->cvs + idx * BLAKE3_OUT_LEN);
-        }
-        else {
-            cv_from_chunk_bytes(base + off, len, idx, ctx->cvs + idx * BLAKE3_OUT_LEN);
-        }
-        idx++;
-    }
-}
-
-// hash_chunk_span_fd
-// reads and hashes a range of chunks directly from file descriptor ctx->fd
-// falls back to pread() for each chunk when mmap is unavailable
-// uses a TLS-aligned buffer and SIMD hashing for throughput
-// returns 0 on success or -1 on I/O/memory error (errno stored in ctx->io_error_code)
-static int hash_chunk_span_fd(perfile_ctx* ctx, size_t start_index, size_t span_count) {
-    if (span_count == 0)
-        return 0;
-
-    const size_t chunk_len = BLAKE3_CHUNK_LEN;
-    const size_t total_bytes = span_count * chunk_len;
-
-    size_t buf_cap = 0;
-    uint8_t* buf = ensure_tls_io_buffer(total_bytes, &buf_cap);
-    if (!buf || buf_cap < total_bytes) {
-        ctx->io_error_code = ENOMEM;
-        return -1;
-    }
-
-    // read each chunk fully into TLS buffer
-    for (size_t i = 0; i < span_count; i++) {
-        size_t chunk_idx = start_index + i;
-        size_t len = chunk_len_for_index_pf(ctx, chunk_idx);
-        uint8_t* dst = buf + i * chunk_len;
-
-        if (len == 0) {
-            memset(dst, 0, chunk_len);
-            continue;
-        }
-
-        off_t off = (off_t)((uint64_t)chunk_idx * chunk_len);
-        size_t done = 0;
-        while (done < len) {
-            ssize_t r = pread(ctx->fd, dst + done, len - done, off + (off_t)done);
-            if (r > 0) {
-                done += (size_t)r;
-                continue;
-            }
-            if (r == 0) {  // unexpected EOF
-                ctx->io_error_code = EIO;
-                return -1;
-            }
-            if (errno == EINTR)
-                continue;
-            ctx->io_error_code = errno;
-            return -1;
-        }
-
-        if (len < chunk_len)
-            memset(dst + len, 0, chunk_len - len);
-    }
-
-    const size_t simd = blake3_simd_degree() ?: 1;
-    const size_t blocks_per_chunk = chunk_len / BLAKE3_BLOCK_LEN;
-    const uint8_t* inputs[MAX_SIMD_DEGREE];
-
-    size_t idx = 0;
-    size_t remain = span_count;
-
-    // process full SIMD-width groups
-    while (remain >= simd) {
-        for (size_t i = 0; i < simd; i++)
-            inputs[i] = buf + (idx + i) * chunk_len;
-
-        blake3_hash_many(inputs, simd, blocks_per_chunk, IV, start_index + idx, true, 0, CHUNK_START, CHUNK_END, ctx->cvs + (start_index + idx) * BLAKE3_OUT_LEN);
-
-        idx += simd;
-        remain -= simd;
-    }
-
-    // handle any tail chunks
-    while (remain--) {
-        inputs[0] = buf + idx * chunk_len;
-        cv_from_chunk_bytes(inputs[0], chunk_len, start_index + idx, ctx->cvs + (start_index + idx) * BLAKE3_OUT_LEN);
-        idx++;
-    }
-
-    return 0;
-}
-
-// perfile_worker_proc
-// worker thread entry for hashing assigned chunk ranges of one file
-// repeatedly claims chunk batches atomically from ctx->next_chunk
-// exits when all chunks are done or an error occurs in any thread
-static void* perfile_worker_proc(void* arg) {
-    perfile_ctx* ctx = ((perfile_worker_arg*)arg)->ctx;
-    const size_t job = ctx->chunks_per_job;
-
-    for (;;) {
-        // atomically claim a span of chunks
-        size_t start = atomic_fetch_add_explicit(&ctx->next_chunk, job, memory_order_acq_rel);
-        if (start >= ctx->total_chunks)
-            break;
-
-        size_t span = ctx->total_chunks - start;
-        if (span > job)
-            span = job;
-
-        // early exit if another worker reported failure
-        if (atomic_load_explicit(&ctx->had_error, memory_order_acquire))
-            break;
-
-        // choose optimal source (mmap or direct fd)
-        int err = 0;
-        if (ctx->map)
-            hash_chunk_span_mem(ctx, start, span);
-        else if ((err = hash_chunk_span_fd(ctx, start, span)) != 0)
-            atomic_store_explicit(&ctx->had_error, 1, memory_order_release);
-
-        if (err)
-            break;
-    }
-
-    return NULL;
-}
-
-// build_all_chunk_cvs
-// hashes all chunks in the file (mapped or read from fd) and fills ctx->cvs
-// batches work in SIMD-width groups for maximum parallelism
-// returns 0 on success or -1 on I/O/memory error
-static int build_all_chunk_cvs(perfile_ctx* ctx) {
-    const size_t simd = blake3_simd_degree() ?: 1;
-    size_t done = 0;
-    const size_t total = ctx->total_chunks;
-
-    while (done < total) {
-        size_t remain = total - done;
-        size_t batch = remain >= simd ? simd * (remain / simd) : remain;
-
-        int err = 0;
-        if (ctx->map)
-            hash_chunk_span_mem(ctx, done, batch);
-        else if ((err = hash_chunk_span_fd(ctx, done, batch)) != 0)
-            return -1;
-
-        done += batch;
-    }
-
-    return 0;
-}
-
-// reduce_cvs_to_two
-// reduces an array of per-chunk chaining values (CVs) into ≤2 parents
-// performs binary tree compression in SIMD batches using blake3_hash_many
-// returns the new CV count (1 or 2)
-static size_t reduce_cvs_to_two(uint8_t* cvs, size_t cv_count) {
-    if (cv_count <= 2)
-        return cv_count;
-
-    const size_t simd = blake3_simd_degree() ?: 1;
-    const size_t max_deg = simd > MAX_SIMD_DEGREE ? MAX_SIMD_DEGREE : simd;
-
-    uint8_t blocks[MAX_SIMD_DEGREE * BLAKE3_BLOCK_LEN];
-    const uint8_t* ptrs[MAX_SIMD_DEGREE];
-
-    size_t n = cv_count;
-
-    while (n > 2) {
-        size_t out = 0, i = 0;
-
-        // combine pairs of CVs into parents
-        while (i + 1 < n) {
-            size_t batch = 0;
-            for (; batch < max_deg && i + 1 < n; batch++, i += 2) {
-                uint8_t* blk = blocks + batch * BLAKE3_BLOCK_LEN;
-                memcpy(blk, cvs + i * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
-                memcpy(blk + BLAKE3_OUT_LEN, cvs + (i + 1) * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
-                ptrs[batch] = blk;
-            }
-
-            blake3_hash_many(ptrs, batch, 1, IV, 0, false, PARENT, 0, 0, cvs + out * BLAKE3_OUT_LEN);
-            out += batch;
-        }
-
-        // handle odd leftover CV
-        if (i < n) {
-            if (out != i)
-                memmove(cvs + out * BLAKE3_OUT_LEN, cvs + i * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
-            out++;
-        }
-
-        n = out;
-    }
-
-    return n;
-}
-
-// root_output_from_two_cvs
-// combines two child CVs into the root hash output
-// uses PARENT|ROOT flags for final compression, matching official BLAKE3 output
-static void root_output_from_two_cvs(const uint8_t left[BLAKE3_OUT_LEN], const uint8_t right[BLAKE3_OUT_LEN], uint8_t out_hash[BLAKE3_OUT_LEN]) {
-    uint8_t block[BLAKE3_BLOCK_LEN];
-    memcpy(block, left, BLAKE3_OUT_LEN);
-    memcpy(block + BLAKE3_OUT_LEN, right, BLAKE3_OUT_LEN);
-
-    uint8_t wide[64];
-    blake3_compress_xof(IV, block, BLAKE3_BLOCK_LEN, 0, (uint8_t)(PARENT | ROOT), wide);
-
-    memcpy(out_hash, wide, BLAKE3_OUT_LEN);
-}
-
-// perfile_finalize_hash
-// final reduction and output stage for a single file hash
-// combines per-chunk CVs into a single digest identical to standard BLAKE3
-// returns 0 on success or -1 on error (errno set)
-static int perfile_finalize_hash(perfile_ctx* ctx, uint8_t out_hash[BLAKE3_OUT_LEN]) {
-    if (atomic_load_explicit(&ctx->had_error, memory_order_acquire)) {
-        errno = ctx->io_error_code ? ctx->io_error_code : EIO;
-        return -1;
-    }
-
-    // special case: single small chunk (fast path)
-    if (ctx->total_chunks == 1) {
-        blake3_hasher h;
-        blake3_hasher_init(&h);
-
-        size_t len = (size_t)ctx->size;
-        const uint8_t* data = NULL;
-        size_t buf_sz = 0;
-
-        if (ctx->map) {
-            data = ctx->map;
-        }
-        else {
-            if (lseek(ctx->fd, 0, SEEK_SET) == (off_t)-1) {
-                errno = EIO;
-                return -1;
-            }
-            data = ensure_tls_io_buffer(len, &buf_sz);
-            if (!data || buf_sz < len) {
-                errno = ENOMEM;
-                return -1;
-            }
-
-            size_t have = 0;
-            while (have < len) {
-                ssize_t r = read(ctx->fd, (uint8_t*)data + have, len - have);
-                if (r > 0) {
-                    have += (size_t)r;
-                    continue;
-                }
-                if (r == 0) {
-                    errno = EIO;
-                    return -1;
-                }
-                if (errno != EINTR) {
-                    errno = EIO;
-                    return -1;
-                }
-            }
-        }
-
-        blake3_hasher_update(&h, data, len);
-        blake3_hasher_finalize(&h, out_hash, BLAKE3_OUT_LEN);
-        return 0;
-    }
-
-    // reduce to 1 or 2 CVs, then finalize
-    size_t remain = reduce_cvs_to_two(ctx->cvs, ctx->total_chunks);
-
-    if (remain == 2) {
-        root_output_from_two_cvs(ctx->cvs, ctx->cvs + BLAKE3_OUT_LEN, out_hash);
-        return 0;
-    }
-
-    if (remain == 1) {
-        memcpy(out_hash, ctx->cvs, BLAKE3_OUT_LEN);
-        return 0;
-    }
-
-    errno = EIO;
-    return -1;
-}
 
 // hash_regular_file_parallel
 // hashes a regular file using BLAKE3 tree mode
-// - mmaps file when possible
-// - processes chunks in parallel via a local worker team
-// - reduces all chaining values to a single root digest
+// - mmaps file when possible, using parallel hash engine for adaptive method selection
+// - falls back to streaming hash for non-mmapable files
 // returns 0 on success, -1 on error (errno set)
 static int hash_regular_file_parallel(const program_opts* opts, const char* name, int fd, const struct stat* st, uint8_t out_hash[BLAKE3_OUT_LEN]) {
     (void)opts;
@@ -687,73 +275,59 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         return rc;
     }
 
-    // allocate per-chunk CV array
-    ctx.cvs = malloc(ctx.total_chunks * BLAKE3_OUT_LEN);
-    if (!ctx.cvs) {
-        if (ctx.map)
+    // Large file path: use parallel hash engine if mmap succeeded
+    if (ctx.map) {
+        // Debug
+        fprintf(stderr, "DEBUG: Using parallel engine for %ld bytes (mmap)\n", (long)ctx.size);
+        // Configure parallel engine
+        b3p_config_t cfg = b3p_config_default();
+        int nthreads = opts->jobs;
+        if (nthreads == 0) {
+            nthreads = get_nprocs();
+        }
+        
+        // Clamp threads based on file size to avoid excessive overhead
+        // Each task is B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN bytes.
+        // We shouldn't spawn more threads than tasks.
+        size_t task_size = (size_t)B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN;
+        size_t num_tasks = ((size_t)ctx.size + task_size - 1) / task_size;
+        if (num_tasks < 1) num_tasks = 1;
+        if ((size_t)nthreads > num_tasks) {
+            nthreads = (int)num_tasks;
+        }
+        
+        cfg.nthreads = nthreads;
+
+        b3p_ctx_t* b3p = b3p_create(&cfg);
+        if (!b3p) {
             munmap((void*)ctx.map, ctx.map_len);
-        errno = ENOMEM;
-        return -1;
-    }
-
-    // large file path: multi-threaded chunk hashing
-    if (ctx.size > (8u << 20)) {
-        atomic_store_explicit(&ctx.next_chunk, 0, memory_order_release);
-
-        size_t simd = blake3_simd_degree() ?: 1;
-        size_t chunks_per_job = (ctx.total_chunks > 1024) ? 512 : (ctx.total_chunks > 256) ? 128 : 64;
-        size_t rounded = (chunks_per_job / simd) * simd;
-        ctx.chunks_per_job = rounded ? rounded : 1;
-
-        int cores = get_nprocs();
-        int threads = cores < (int)ctx.total_chunks ? cores : (int)ctx.total_chunks;
-        if (threads < 1)
-            threads = 1;
-        if (threads > 16)
-            threads = 16;
-
-        pthread_t* pool = malloc(sizeof(pthread_t) * (size_t)threads);
-        if (!pool) {
-            if (ctx.map)
-                munmap((void*)ctx.map, ctx.map_len);
-            free(ctx.cvs);
             errno = ENOMEM;
             return -1;
         }
-
-        perfile_worker_arg arg = {.ctx = &ctx};
-        int started = 0;
-
-        for (int i = 0; i < threads; i++) {
-            if (pthread_create(&pool[i], NULL, perfile_worker_proc, &arg) != 0)
-                break;
-            started++;
+        // Convert IV to bytes (little-endian)
+        uint8_t iv_bytes[BLAKE3_KEY_LEN];
+        for (size_t i = 0; i < 8; i++) {
+            uint32_t w = IV[i];
+            iv_bytes[i * 4 + 0] = (uint8_t)(w >> 0);
+            iv_bytes[i * 4 + 1] = (uint8_t)(w >> 8);
+            iv_bytes[i * 4 + 2] = (uint8_t)(w >> 16);
+            iv_bytes[i * 4 + 3] = (uint8_t)(w >> 24);
         }
-
-        // main thread assists
-        perfile_worker_proc(&arg);
-
-        for (int i = 0; i < started; i++)
-            pthread_join(pool[i], NULL);
-
-        free(pool);
-    }
-    else {
-        if (build_all_chunk_cvs(&ctx) != 0) {
-            if (ctx.map)
-                munmap((void*)ctx.map, ctx.map_len);
-            free(ctx.cvs);
+        int rc = b3p_hash_one_shot(b3p, ctx.map, (size_t)ctx.size, iv_bytes, 0, B3P_METHOD_AUTO, out_hash, BLAKE3_OUT_LEN);
+        b3p_destroy(b3p);
+        munmap((void*)ctx.map, ctx.map_len);
+        if (rc != 0) {
             errno = EIO;
             return -1;
         }
+        return 0;
     }
 
-    // reduce and finalize
-    int rc = perfile_finalize_hash(&ctx, out_hash);
-
+    // mmap failed or not attempted; fall back to streaming hash
+    // This handles pipes, sockets, and files that cannot be mmapped
+    int rc = hash_fd_stream_fast(fd, ctx.size, out_hash);
     if (ctx.map)
         munmap((void*)ctx.map, ctx.map_len);
-    free(ctx.cvs);
     return rc;
 }
 
