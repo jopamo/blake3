@@ -216,6 +216,14 @@ test_keyed = executable(
 )
 test('keyed', test_keyed)
 
+test_b3p_comprehensive = executable(
+  'test_b3p_comprehensive',
+  ['tests/test_b3p_comprehensive.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('b3p_comprehensive', test_b3p_comprehensive)
+
 test('cli',
   find_program('tests/test_cli.sh'),
   depends: [b3sum_exe],
