@@ -119,7 +119,7 @@ static b3p_method_t b3p_pick_heuristic(struct b3p_ctx *ctx);
 
 static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
 static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root);
-static void b3p_reduce_in_place(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, b3_cv_bytes_t *out_root, int is_final);
+static void b3p_reduce_stack(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, size_t subtree_chunks, b3_cv_bytes_t *out_root, int is_final);
 
 static int b3p_compute_root(
   struct b3p_ctx *ctx,
@@ -482,10 +482,20 @@ static b3p_method_t b3p_pick_heuristic(struct b3p_ctx *ctx) {
  * Method implementations
  * ===========================================================================*/
 
+static inline void b3p_hash_range_to_root(
+  struct b3p_ctx *ctx,
+  size_t chunk_start,
+  size_t chunk_end,
+  b3_cv_bytes_t *restrict tmp,
+  b3_cv_bytes_t *restrict out_root,
+  int is_root
+);
+
 typedef struct {
   struct b3p_ctx *ctx;
   atomic_size_t next_chunk;
   size_t end_chunk;
+  size_t batch_step;
   b3_cv_bytes_t *out_cvs;
 } b3p_chunks_job_t;
 
@@ -500,76 +510,34 @@ typedef struct {
 static void b3p_task_hash_chunks(void *arg) {
   b3p_chunks_job_t *job = arg;
   struct b3p_ctx *ctx = job->ctx;
-
-  size_t simd_degree = blake3_simd_degree();
-  if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
-
-  // Process larger batches to reduce atomic contention
-  size_t batch_step = simd_degree * 64; 
+  
+  // Local buffer for batch reduction
+  // Max batch step is MAX_SIMD_DEGREE * 64 = 16 * 64 = 1024
+  b3_cv_bytes_t local_buf[1024];
 
   for (;;) {
-    size_t batch_start = atomic_fetch_add_explicit(&job->next_chunk, batch_step, memory_order_relaxed);
+    size_t batch_start = atomic_fetch_add_explicit(&job->next_chunk, job->batch_step, memory_order_relaxed);
     if (batch_start >= job->end_chunk)
       break;
 
-    size_t batch_limit = batch_start + batch_step;
+    size_t batch_limit = batch_start + job->batch_step;
     if (batch_limit > job->end_chunk) batch_limit = job->end_chunk;
 
-    size_t i = batch_start;
-    const uint8_t *input_ptr = ctx->input + i * (size_t)BLAKE3_CHUNK_LEN;
-
-    while (i < batch_limit) {
-        size_t count = simd_degree;
-        if (i + count > batch_limit)
-          count = batch_limit - i;
-
-        size_t full_count = count;
-        // Only the very last chunk of the entire input might be partial.
-        if (i + count == ctx->num_chunks) {
-          size_t off = (ctx->num_chunks - 1) * (size_t)BLAKE3_CHUNK_LEN;
-          if (ctx->input_len - off < (size_t)BLAKE3_CHUNK_LEN) {
-            full_count--;
-          }
-        }
-
-        if (full_count > 0) {
-          const uint8_t *inputs[MAX_SIMD_DEGREE];
-          for (size_t j = 0; j < full_count; j++) {
-            inputs[j] = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
-          }
-          uint8_t flags_common = ctx->kf.flags;
-          uint8_t flags_end = CHUNK_END;
-          if (ctx->num_chunks == 1) {
-             flags_end |= ROOT;
-          }
-          
-          blake3_hash_many(inputs, full_count, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN,
-                           ctx->kf.key, (uint64_t)i, true, flags_common, CHUNK_START, flags_end,
-                           job->out_cvs[i].bytes);
-        }
-
-        if (full_count < count) {
-          size_t j = full_count;
-          size_t idx = i + j;
-          const uint8_t *partial_ptr = input_ptr + j * (size_t)BLAKE3_CHUNK_LEN;
-          size_t off = idx * (size_t)BLAKE3_CHUNK_LEN;
-          size_t remain = ctx->input_len - off;
-          size_t clen = remain < (size_t)BLAKE3_CHUNK_LEN ? remain : (size_t)BLAKE3_CHUNK_LEN;
-          b3_hash_chunk_cv_impl(ctx->kf.key, ctx->kf.flags, partial_ptr, clen, (uint64_t)idx, (ctx->num_chunks == 1), job->out_cvs[idx].bytes);
-        }
-        
-        i += count;
-        input_ptr += count * (size_t)BLAKE3_CHUNK_LEN;
-    }
+    size_t batch_idx = batch_start / job->batch_step;
+    
+    // Check if this batch covers the entire input (only possible if 1 batch)
+    int is_root = (batch_start == 0 && batch_limit == ctx->num_chunks);
+    
+    b3p_hash_range_to_root(ctx, batch_start, batch_limit, local_buf, &job->out_cvs[batch_idx], is_root);
   }
 }
 
-static void b3p_hash_range_to_root(
+static inline void b3p_hash_range_to_root(
   struct b3p_ctx *ctx,
   size_t chunk_start,
   size_t chunk_end,
-  b3_cv_bytes_t *tmp,
-  b3_cv_bytes_t *out_root,
+  b3_cv_bytes_t *restrict tmp,
+  b3_cv_bytes_t *restrict out_root,
   int is_root
 ) {
   size_t n = chunk_end - chunk_start;
@@ -629,7 +597,7 @@ static void b3p_hash_range_to_root(
       input_ptr += count * (size_t)BLAKE3_CHUNK_LEN;
   }
 
-  b3p_reduce_in_place(ctx, tmp, n, out_root, is_root);
+  b3p_reduce_stack(ctx, tmp, n, 1, out_root, is_root);
 }
 
 static void b3p_task_hash_subtrees(void *arg) {
@@ -667,62 +635,101 @@ static void b3p_task_hash_subtrees(void *arg) {
   }
 }
 
-static void b3p_reduce_in_place(struct b3p_ctx *ctx, b3_cv_bytes_t *cvs, size_t n, b3_cv_bytes_t *out_root, int is_final) {
-  while (n > 1) {
-    size_t parents = 0;
-    size_t i = 0;
+static inline void b3p_merge_nodes(const uint32_t key[8], uint8_t base_flags, 
+                                   const b3_cv_bytes_t *left, const b3_cv_bytes_t *restrict right, 
+                                   b3_cv_bytes_t *out, int is_root) {
+    uint8_t flags = base_flags | PARENT;
+    if (is_root) flags |= ROOT;
+    b3_hash_parent_cv_impl(key, flags, left->bytes, right->bytes, out->bytes);
+}
 
-    size_t simd_degree = blake3_simd_degree();
-    if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
+static void b3p_reduce_stack(struct b3p_ctx *ctx, b3_cv_bytes_t *restrict cvs, size_t n, size_t subtree_chunks, b3_cv_bytes_t *restrict out_root, int is_final) {
+  size_t stack_counts[64];
+  size_t top = 0;
 
-    while (i + 2 * simd_degree <= n) {
-        const uint8_t *inputs[MAX_SIMD_DEGREE];
-
-        for (size_t j = 0; j < simd_degree; j++) {
-            // The left and right CVs are contiguous in memory.
-            // cvs[k] is 32 bytes. cvs[k+1] is the next 32 bytes.
-            // So &cvs[i + 2*j] points to the start of the 64-byte parent block.
-            inputs[j] = cvs[i + 2 * j].bytes;
-        }
-
-        uint8_t flags = ctx->kf.flags | PARENT;
-        if (is_final && n == 2) flags |= ROOT;
-
-        blake3_hash_many(inputs, simd_degree, 1, ctx->kf.key, 0, false, flags, 0, 0,
-                         cvs[parents].bytes);
-        
-        i += 2 * simd_degree;
-        parents += simd_degree;
-    }
-
-    for (; i + 1 < n; i += 2) {
-      uint8_t flags = ctx->kf.flags | PARENT;
-      if (is_final && n == 2) {
-          flags |= ROOT;
-      }
-      b3_hash_parent_cv_impl(ctx->kf.key, flags, cvs[i].bytes, cvs[i + 1].bytes, cvs[parents].bytes);
-      parents++;
-    }
-
-    if (i < n) {
-      cvs[parents] = cvs[i];
-      parents++;
-    }
-
-    n = parents;
+  // Pre-calculate total count to identify when we've formed the root
+  size_t total_count = 0;
+  for (size_t i = 0; i < n; i++) {
+     size_t count = subtree_chunks;
+     if (subtree_chunks > 1 && i == n - 1) {
+         size_t remainder = ctx->num_chunks % subtree_chunks;
+         if (remainder != 0) count = remainder;
+     }
+     total_count += count;
   }
 
+  for (size_t i = 0; i < n; i++) {
+    size_t count = subtree_chunks;
+    if (subtree_chunks > 1 && i == n - 1) {
+         size_t remainder = ctx->num_chunks % subtree_chunks;
+         if (remainder != 0) count = remainder;
+    }
+    
+    // Push: In-place, so we just set the count. The CV is already at cvs[i].
+    // If top != i, we need to move it.
+    // However, since we are consuming cvs[i] and potentially writing to cvs[top],
+    // and top <= i always, we can copy.
+    if (top != i) {
+        cvs[top] = cvs[i];
+    }
+    stack_counts[top] = count;
+    top++;
+
+    // Merge
+    while (top >= 2) {
+      if (stack_counts[top-1] == stack_counts[top-2]) {
+         size_t right_idx = top - 1;
+         size_t left_idx = top - 2;
+         
+         size_t new_count = stack_counts[left_idx] + stack_counts[right_idx];
+         int is_root = (is_final && new_count == total_count);
+         
+         b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, 
+                         &cvs[left_idx], &cvs[right_idx], 
+                         &cvs[left_idx], is_root);
+         
+         stack_counts[left_idx] = new_count;
+         top--; // Pop right
+      } else {
+         break;
+      }
+    }
+  }
+
+  // Collapse remaining stack from right to left
+  while (top > 1) {
+     size_t right_idx = top - 1;
+     size_t left_idx = top - 2;
+     
+     size_t new_count = stack_counts[left_idx] + stack_counts[right_idx];
+     int is_root = (is_final && new_count == total_count);
+
+     b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, 
+                     &cvs[left_idx], &cvs[right_idx], 
+                     &cvs[left_idx], is_root);
+     
+     stack_counts[left_idx] = new_count;
+     top--;
+  }
+  
   *out_root = cvs[0];
 }
 
 static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
-  if (b3p_ensure_scratch(ctx, ctx->num_chunks) != 0)
+  size_t simd_degree = blake3_simd_degree();
+  if (simd_degree > MAX_SIMD_DEGREE) simd_degree = MAX_SIMD_DEGREE;
+  size_t batch_step = simd_degree * 64;
+
+  size_t num_batches = (ctx->num_chunks + batch_step - 1) / batch_step;
+
+  if (b3p_ensure_scratch(ctx, num_batches) != 0)
     return -1;
 
   b3p_chunks_job_t job = {
     .ctx = ctx,
     .next_chunk = 0,
     .end_chunk = ctx->num_chunks,
+    .batch_step = batch_step,
     .out_cvs = ctx->scratch_cvs
   };
 
@@ -736,7 +743,7 @@ static int b3p_run_method_a_chunks(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root)
   b3p_taskgroup_wait(&g);
   b3p_taskgroup_destroy(&g);
 
-  b3p_reduce_in_place(ctx, ctx->scratch_cvs, ctx->num_chunks, out_root, 1);
+  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_batches, batch_step, out_root, 1);
   return 0;
 }
 
@@ -744,7 +751,11 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_roo
 #if DEBUG_PARALLEL
   fprintf(stderr, "[parallel] method B: input_len=%zu num_chunks=%zu nthreads=%zu\n", ctx->input_len, ctx->num_chunks, ctx->pool.nthreads);
 #endif
-  size_t subtree_chunks = ctx->cfg.subtree_chunks ? ctx->cfg.subtree_chunks : B3P_DEFAULT_SUBTREE_CHUNKS;
+  size_t subtree_chunks = ctx->cfg.subtree_chunks;
+  if (subtree_chunks == 0) {
+    subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS;
+  }
+  subtree_chunks = round_down_to_power_of_2(subtree_chunks);
   size_t num_subtrees = (ctx->num_chunks + subtree_chunks - 1) / subtree_chunks;
 #if DEBUG_PARALLEL
   fprintf(stderr, "[parallel] subtree_chunks=%zu num_subtrees=%zu\n", subtree_chunks, num_subtrees);
@@ -769,14 +780,16 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx *ctx, b3_cv_bytes_t *out_roo
     b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_subtrees, &job);
 
   b3p_taskgroup_wait(&g);
-  b3p_taskgroup_destroy(&g);
-
-  b3p_reduce_in_place(ctx, ctx->scratch_cvs, num_subtrees, out_root, 1);
+  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1);
   return 0;
 }
 
 static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
-  size_t subtree_chunks = ctx->cfg.subtree_chunks ? ctx->cfg.subtree_chunks : B3P_DEFAULT_SUBTREE_CHUNKS;
+  size_t subtree_chunks = ctx->cfg.subtree_chunks;
+  if (subtree_chunks == 0) {
+    subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS;
+  }
+  subtree_chunks = round_down_to_power_of_2(subtree_chunks);
   size_t num_subtrees = (ctx->num_chunks + subtree_chunks - 1) / subtree_chunks;
 
   if (b3p_ensure_scratch(ctx, num_subtrees) != 0)
@@ -801,7 +814,7 @@ static int b3p_run_serial(struct b3p_ctx *ctx, b3_cv_bytes_t *out_root) {
   
   // free(tmp) removed because tmp is TLS
 
-  b3p_reduce_in_place(ctx, ctx->scratch_cvs, num_subtrees, out_root, 1);
+  b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1);
   return 0;
 }
 
