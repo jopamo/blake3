@@ -32,16 +32,46 @@ static __thread b3_cv_bytes_t *g_tls_cv_buf = NULL;
 static __thread size_t g_tls_cv_cap = 0;
 
 static b3_cv_bytes_t* ensure_tls_cv_buffer(size_t count) {
-    if (count > g_tls_cv_cap) {
-        size_t new_cap = g_tls_cv_cap ? g_tls_cv_cap : 1024;
-        while (new_cap < count) new_cap *= 2;
+    if (count == 0) {
+        return g_tls_cv_buf;
+    }
 
-        b3_cv_bytes_t *new_buf = realloc(g_tls_cv_buf, new_cap * sizeof(b3_cv_bytes_t));
-        if (!new_buf) return NULL;
+    const size_t max_elems = SIZE_MAX / sizeof(b3_cv_bytes_t);
+    if (count > max_elems) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    if (count > g_tls_cv_cap) {
+        size_t new_cap = g_tls_cv_cap ? g_tls_cv_cap : (size_t)1024;
+
+        if (new_cap > max_elems) {
+            new_cap = max_elems;
+        }
+
+        while (new_cap < count) {
+            if (new_cap > max_elems / 2) {
+                new_cap = count;
+                break;
+            }
+            new_cap *= 2;
+        }
+
+        if (new_cap > max_elems) {
+            errno = ENOMEM;
+            return NULL;
+        }
+
+        size_t bytes = new_cap * sizeof(b3_cv_bytes_t);
+        b3_cv_bytes_t *new_buf = realloc(g_tls_cv_buf, bytes);
+        if (!new_buf) {
+            return NULL;
+        }
 
         g_tls_cv_buf = new_buf;
         g_tls_cv_cap = new_cap;
     }
+
     return g_tls_cv_buf;
 }
 
