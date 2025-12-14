@@ -490,14 +490,23 @@ INLINE void blake3_hasher_update_base(blake3_hasher* self, const void* input, si
         // chunk by itself. Otherwise, compress the subtree into a pair of CVs.
         uint64_t subtree_chunks = subtree_len / BLAKE3_CHUNK_LEN;
         if (subtree_len <= BLAKE3_CHUNK_LEN) {
-            blake3_chunk_state chunk_state;
-            chunk_state_init(&chunk_state, self->key, self->chunk.flags);
-            chunk_state.chunk_counter = self->chunk.chunk_counter;
-            chunk_state_update(&chunk_state, input_bytes, subtree_len);
-            output_t output = chunk_state_output(&chunk_state);
-            uint8_t cv[BLAKE3_OUT_LEN];
-            output_chaining_value(&output, cv);
-            hasher_push_cv(self, cv, chunk_state.chunk_counter);
+            // Favor sequential memory access: process chunks in increasing order so the CPU’s prefetchers and caches work effectively
+            // Avoid copying input into temporary buffers for full chunks; only buffer partial chunks at the tail
+            if (subtree_len == BLAKE3_CHUNK_LEN) {
+                uint8_t cv[BLAKE3_OUT_LEN];
+                b3_hash_chunk_cv_impl(self->key, self->chunk.flags, input_bytes,
+                                      subtree_len, self->chunk.chunk_counter, false, cv);
+                hasher_push_cv(self, cv, self->chunk.chunk_counter);
+            } else {
+                blake3_chunk_state chunk_state;
+                chunk_state_init(&chunk_state, self->key, self->chunk.flags);
+                chunk_state.chunk_counter = self->chunk.chunk_counter;
+                chunk_state_update(&chunk_state, input_bytes, subtree_len);
+                output_t output = chunk_state_output(&chunk_state);
+                uint8_t cv[BLAKE3_OUT_LEN];
+                output_chaining_value(&output, cv);
+                hasher_push_cv(self, cv, chunk_state.chunk_counter);
+            }
         }
         else {
             // This is the high-performance happy path, though getting here depends
