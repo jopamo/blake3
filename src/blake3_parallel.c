@@ -471,7 +471,7 @@ static b3p_method_t b3p_pick_heuristic(struct b3p_ctx *ctx) {
   size_t simd = blake3_simd_degree();
   size_t effective_lane = b3_min_sz(simd, (size_t)MAX_SIMD_DEGREE);
 
-  size_t chunks_per_thread_floor = 128 * effective_lane;
+  size_t chunks_per_thread_floor = ctx->cfg.method_b_min_chunks_per_thread * effective_lane;
   if (chunks >= ctx->pool.nthreads * chunks_per_thread_floor) return B3P_METHOD_B_SUBTREES;
 
   return B3P_METHOD_A_CHUNKS;
