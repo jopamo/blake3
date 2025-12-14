@@ -160,7 +160,7 @@ b3p_ctx_t *b3p_create(const b3p_config_t *cfg) {
   }
 
   if (nthreads > 1) {
-      if (b3p_pool_init(&ctx->pool, nthreads, 256) != 0) {
+      if (b3p_pool_init(&ctx->pool, nthreads, nthreads * 2 < 2 ? 2 : nthreads * 2) != 0) {
         free(ctx);
         return NULL;
       }
