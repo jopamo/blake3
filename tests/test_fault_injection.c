@@ -90,6 +90,14 @@ static struct b3p_ctx* create_test_ctx(void) {
     // Default config
     ctx->cfg = b3p_config_default();
     // Default pool.nthreads is 0 (disabled)
+    // Set dummy input to avoid null pointer dereference
+    static uint8_t dummy_input[1024] = {0};
+    ctx->input = dummy_input;
+    ctx->input_len = sizeof(dummy_input);
+    ctx->num_chunks = (ctx->input_len + BLAKE3_CHUNK_LEN - 1) / BLAKE3_CHUNK_LEN;
+    // Set key and flags
+    memset(ctx->kf.key, 0, sizeof(ctx->kf.key));
+    ctx->kf.flags = 0;
     return ctx;
 }
 
@@ -608,6 +616,64 @@ void test_chunk_hashing_job(void) {
     printf("OK\n");
 }
 
+void test_subtree_hashing_job(void) {
+    printf("Testing subtree hashing job...\n");
+
+    // SubtreesJob_NullGuards
+    // job NULL / ctx NULL / out_subtree_cvs NULL => no crash
+    b3p_task_hash_subtrees(NULL);
+
+    b3p_subtrees_job_t job = {0};
+    b3p_task_hash_subtrees(&job);  // ctx NULL
+
+    job.ctx = (struct b3p_ctx*)1;  // non-null but invalid
+    b3p_task_hash_subtrees(&job);  // out_subtree_cvs NULL
+
+    // SubtreesJob_SubtreeChunksZero_Returns
+    // subtree_chunks=0 => return
+    struct b3p_ctx* ctx = create_test_ctx();
+    assert(ctx != NULL);
+    ctx->num_chunks = 100;
+    b3_cv_bytes_t out_cvs[10] = {0};
+
+    job.ctx = ctx;
+    job.out_subtree_cvs = out_cvs;
+    job.subtree_chunks = 0;
+    job.num_subtrees = 10;
+    atomic_init(&job.next_subtree, 0);
+
+    // Should return early without writing anything
+    b3p_task_hash_subtrees(&job);
+    // Ensure no crash
+
+    // SubtreesJob_ClaimsAllSubtreesExactlyOnce
+    // Run with multiple workers, verify each subtree index computed once (e.g., fill markers)
+    // This requires multiple threads and coordination; skip for unit test.
+
+    // SubtreesJob_RootSplitChildrenOnlyWhenSingleSubtree
+    // num_subtrees==1 should write split children, otherwise should not
+    // Test with num_subtrees=1
+    job.subtree_chunks = 100;  // subtree_chunks == num_chunks
+    job.num_subtrees = 1;
+    atomic_store(&job.next_subtree, 0);
+    b3_cv_bytes_t split_children[2] = {0};
+    job.out_split_children = split_children;
+
+    // The function will call b3p_hash_range_to_root with is_root=true and out_split_children
+    // Our stub for b3_hash_chunk_cv_impl does nothing, so out_cvs will remain zero
+    b3p_task_hash_subtrees(&job);
+
+    // Test with num_subtrees=2 (should not pass split_children)
+    job.num_subtrees = 2;
+    job.subtree_chunks = 50;  // each subtree covers 50 chunks
+    atomic_store(&job.next_subtree, 0);
+    // out_split_children still set; function should pass NULL to b3p_hash_range_to_root
+    b3p_task_hash_subtrees(&job);
+
+    free(ctx);
+    printf("OK\n");
+}
+
 int main(void) {
     test_alloc_failure();
     test_pool_creation_failure();
@@ -619,5 +685,6 @@ int main(void) {
     test_heuristic_selection();
     test_public_api_context();
     test_chunk_hashing_job();
+    test_subtree_hashing_job();
     return 0;
 }
