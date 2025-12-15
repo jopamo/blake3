@@ -141,6 +141,24 @@ typedef struct {
     b3p_taskq_t q;
 } b3p_pool_t;
 
+typedef struct {
+    struct b3p_ctx* ctx;
+    atomic_size_t next_chunk;
+    size_t end_chunk;
+    size_t batch_step;
+    b3_cv_bytes_t* out_cvs;
+    b3_cv_bytes_t* out_split_children;
+} b3p_chunks_job_t;
+
+typedef struct {
+    struct b3p_ctx* ctx;
+    size_t subtree_chunks;
+    atomic_size_t next_subtree;
+    size_t num_subtrees;
+    b3_cv_bytes_t* out_subtree_cvs;
+    b3_cv_bytes_t* out_split_children;
+} b3p_subtrees_job_t;
+
 /* Parallel hashing context
    Stores the keyed flags and the current input range for one-shot hashing
    Scratch CV storage is kept on the context for amortized reuse across calls */
@@ -170,6 +188,9 @@ static void b3p_taskgroup_wait(b3p_taskgroup_t* g);
 static void* b3p_worker_main(void* arg);
 
 static int b3p_ensure_scratch(struct b3p_ctx* ctx, size_t want_cvs);
+
+static inline void
+b3p_hash_range_to_root(struct b3p_ctx* ctx, size_t chunk_start, size_t chunk_end, b3_cv_bytes_t* restrict tmp, b3_cv_bytes_t* restrict out_root, int is_root, b3_cv_bytes_t* out_split_children);
 
 static b3p_method_t b3p_pick_heuristic(struct b3p_ctx* ctx);
 
