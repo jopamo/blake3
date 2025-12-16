@@ -91,17 +91,7 @@ static void cpuidex(uint32_t out[4], uint32_t id, uint32_t sid) {
 #endif
 }
 
-enum cpu_feature {
-    SSE2 = 1 << 0,
-    SSSE3 = 1 << 1,
-    SSE41 = 1 << 2,
-    AVX = 1 << 3,
-    AVX2 = 1 << 4,
-    AVX512F = 1 << 5,
-    AVX512VL = 1 << 6,
-    NEON = 1 << 7,
-    UNDEFINED = 1 << 30
-};
+enum cpu_feature { SSE2 = 1 << 0, SSSE3 = 1 << 1, SSE41 = 1 << 2, AVX = 1 << 3, AVX2 = 1 << 4, AVX512F = 1 << 5, AVX512VL = 1 << 6, NEON = 1 << 7, UNDEFINED = 1 << 30 };
 
 #if !defined(BLAKE3_TESTING)
 static /* Allow the variable to be controlled manually for testing */
@@ -268,6 +258,8 @@ void blake3_hash_many(const uint8_t* const* inputs,
                       uint8_t flags_start,
                       uint8_t flags_end,
                       uint8_t* out) {
+    if (num_inputs == 0)
+        return;
 #if defined(IS_X86)
     const enum cpu_feature features = get_cpu_features();
     MAYBE_UNUSED(features);
@@ -305,7 +297,9 @@ void blake3_hash_many(const uint8_t* const* inputs,
     }
 #endif
 
-    blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+    if (num_inputs) {
+        blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+    }
 }
 
 // The dynamically detected SIMD degree of the current platform.
