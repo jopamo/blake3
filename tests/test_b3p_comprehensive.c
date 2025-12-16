@@ -142,9 +142,9 @@ void test_determinism(void) {
     b3p_config_t cfg = b3p_config_default();
 
     // 1000 runs
-    b3p_ctx_t *ctx = b3p_create(&cfg);
+    b3p_ctx_t* ctx = b3p_create(&cfg);
     b3p_hash_one_shot(ctx, input, len, key, KEYED_HASH, B3P_METHOD_AUTO, out1, 32);
-    for(int i=0; i<1000; i++) {
+    for (int i = 0; i < 1000; i++) {
         b3p_hash_one_shot(ctx, input, len, key, KEYED_HASH, B3P_METHOD_AUTO, out2, 32);
         ASSERT_EQ(memcmp(out1, out2, 32), 0);
     }
@@ -387,22 +387,23 @@ void test_alignment(void) {
 }
 
 typedef struct {
-    b3p_ctx_t *ctx;
+    b3p_ctx_t* ctx;
     int id;
 } stress_arg_t;
 
-void *stress_thread(void *arg) {
-    stress_arg_t *a = (stress_arg_t*)arg;
+void* stress_thread(void* arg) {
+    stress_arg_t* a = (stress_arg_t*)arg;
     unsigned int seed = (unsigned int)a->id;
     uint8_t key[32] = {0};
     uint8_t out[32];
     // Hash random sizes 0..1MB
-    for(int i=0; i<50; i++) {
+    for (int i = 0; i < 50; i++) {
         size_t len = (size_t)rand_r(&seed) % (1024 * 1024);
-        uint8_t *in = malloc(len ? len : 1);
+        uint8_t* in = malloc(len ? len : 1);
         b3p_hash_one_shot(a->ctx, in, len, key, 0, B3P_METHOD_AUTO, out, 32);
         free(in);
     }
+    b3p_free_tls_resources();
     return NULL;
 }
 

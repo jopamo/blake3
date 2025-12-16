@@ -13,6 +13,11 @@ typedef struct {
     uint8_t flags;
 } b3_keyed_flags_t;
 
+typedef struct {
+    b3_cv_bytes_t* buf;
+    size_t cap;
+} tls_cv_buf_t;
+
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -22,6 +27,23 @@ typedef struct {
 #include <unistd.h>
 #include <alloca.h>
 #include <stdio.h>
+static __thread b3_cv_bytes_t* g_tls_cv_buf = NULL;
+static __thread size_t g_tls_cv_cap = 0;
+
+static pthread_once_t g_tls_cv_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_tls_cv_key;
+
+static void g_tls_cv_key_destructor(void* ptr) {
+    tls_cv_buf_t* tls = (tls_cv_buf_t*)ptr;
+    if (tls) {
+        free(tls->buf);
+        free(tls);
+    }
+}
+
+static void g_tls_cv_key_create(void) {
+    pthread_key_create(&g_tls_cv_key, g_tls_cv_key_destructor);
+}
 
 #define DEBUG_PARALLEL 0
 #define CACHE_LINE_SIZE 64
@@ -50,8 +72,6 @@ static inline size_t next_power_of_2(size_t x) {
 /* Thread-local CV scratch
    Avoids per-task malloc and avoids alloca in deep or repeated calls
    Buffer is grown amortized and reused for the lifetime of the worker thread */
-static __thread b3_cv_bytes_t* g_tls_cv_buf = NULL;
-static __thread size_t g_tls_cv_cap = 0;
 
 #include <errno.h>
 #include <stddef.h>
@@ -118,14 +138,19 @@ static b3_cv_bytes_t* ensure_tls_cv_buffer(size_t count) {
 }
 
 void b3p_free_tls_resources(void) {
-    // Free the TLS CV buffer if it was allocated
+    pthread_once(&g_tls_cv_key_once, g_tls_cv_key_create);
+    tls_cv_buf_t* tls = pthread_getspecific(g_tls_cv_key);
+    if (tls) {
+        free(tls->buf);
+        free(tls);
+        pthread_setspecific(g_tls_cv_key, NULL);
+    }
+    // Free thread-local buffer if allocated
     if (g_tls_cv_buf) {
         free(g_tls_cv_buf);
         g_tls_cv_buf = NULL;
+        g_tls_cv_cap = 0;
     }
-
-    // Always reset capacity so the TLS state is consistent even if buf was already NULL
-    g_tls_cv_cap = 0;
 }
 
 /* Worker pool structures
