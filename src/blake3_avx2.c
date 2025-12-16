@@ -39,7 +39,7 @@ INLINE __m256i rot12(__m256i x) {
 }
 
 INLINE __m256i rot8(__m256i x) {
-    const __m256i mask = _mm256_set_epi8(12, 15, 14, 13, 8, 11, 10, 9, 4, 7, 6, 5, 0, 3, 2, 1, 12, 15, 14, 13, 8, 11, 10, 9, 4, 7, 6, 5, 0, 3, 2, 1);
+    static const __m256i mask = (const __m256i)_mm256_set_epi8(12, 15, 14, 13, 8, 11, 10, 9, 4, 7, 6, 5, 0, 3, 2, 1, 12, 15, 14, 13, 8, 11, 10, 9, 4, 7, 6, 5, 0, 3, 2, 1);
     return _mm256_shuffle_epi8(x, mask);
 }
 
@@ -333,8 +333,12 @@ void blake3_hash_many_avx2(const uint8_t* const* inputs,
     }
 
 #if !defined(BLAKE3_NO_SSE41)
-    blake3_hash_many_sse41(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+    if (num_inputs) {
+        blake3_hash_many_sse41(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+    }
 #else
-    blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+    if (num_inputs) {
+        blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+    }
 #endif
 }
