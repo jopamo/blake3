@@ -8,7 +8,7 @@
 traceroute/traceroute
 
 # Ignore build directories (if applicable)
-build/
+build*
 out/
 
 # Ignore editor files (e.g., vim, emacs)
@@ -19,3 +19,5 @@ out/
 # Ignore IDE specific files (if applicable)
 .vscode/
 .idea/
+
+bench_detail.log
