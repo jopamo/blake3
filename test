@@ -192,7 +192,6 @@ emit_markdown_methodology() {
   echo "**CPU:** ${cpu_summary}" >&3
   echo "" >&3
   echo "**Git:**" >&3
-  echo "- Root: \`${git_root}\`" >&3
   echo "- HEAD: \`${git_head}\`" >&3
   echo "- Commit date: \`${git_date}\`" >&3
   echo "- Working tree: **${git_dirty}**" >&3
