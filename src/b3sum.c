@@ -168,8 +168,8 @@ static _Atomic int done_submitting_tasks = 0;
 
 /* Aggregated results
    Updated by workers, read by main */
-static int any_failure_global = 0;
-static int any_format_error_global = 0;
+static _Atomic int any_failure_global = 0;
+static _Atomic int any_format_error_global = 0;
 
 /* Per-file context */
 typedef struct {
@@ -189,7 +189,6 @@ static int hash_fd_stream_fast(int fd, off_t filesize, uint8_t* output);
    small files may be read fully into a TLS buffer and hashed one-shot
    streaming is the fallback for non-mmapable cases */
 static int hash_regular_file_parallel(const program_opts* opts, const char* name, int fd, const struct stat* st, uint8_t out_hash[BLAKE3_OUT_LEN]) {
-    (void)opts;
     (void)name;
 
     perfile_ctx ctx = {0};
@@ -213,11 +212,12 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
     if (ctx.total_chunks == 0)
         ctx.total_chunks = 1;
 
-    const uint8_t *input_buf = NULL;
+    const uint8_t* input_buf = NULL;
 
     if (ctx.map) {
         input_buf = ctx.map;
-    } else if (ctx.size <= (8u << 20)) {
+    }
+    else if (ctx.size <= (8u << 20)) {
         size_t buf_sz = 0;
         uint8_t* buf = ensure_tls_io_buffer((size_t)ctx.size, &buf_sz);
         if (buf && buf_sz >= (size_t)ctx.size) {
@@ -226,7 +226,7 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
             while (have < (size_t)ctx.size) {
                 ssize_t r;
 #if HAVE_PREADV2_NOWAIT
-                struct iovec iov = { .iov_base = buf + have, .iov_len = (size_t)ctx.size - have };
+                struct iovec iov = {.iov_base = buf + have, .iov_len = (size_t)ctx.size - have};
                 r = preadv2(fd, &iov, 1, -1, RWF_NOWAIT);
                 if (r < 0) {
                     r = read(fd, buf + have, (size_t)ctx.size - have);
@@ -268,13 +268,14 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         /* Small-file fast path
            Avoids parallel engine setup overhead for latency-sensitive sizes */
         if ((size_t)ctx.size <= (1024 * 1024)) {
-             int rc = b3p_hash_buffer_serial(input_buf, (size_t)ctx.size, iv_bytes, 0, out_hash, BLAKE3_OUT_LEN);
-             if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
-             if (rc != 0) {
-                 errno = EIO;
-                 return -1;
-             }
-             return 0;
+            int rc = b3p_hash_buffer_serial(input_buf, (size_t)ctx.size, iv_bytes, 0, out_hash, BLAKE3_OUT_LEN);
+            if (ctx.map)
+                munmap((void*)ctx.map, ctx.map_len);
+            if (rc != 0) {
+                errno = EIO;
+                return -1;
+            }
+            return 0;
         }
 
         b3p_config_t cfg = b3p_config_default();
@@ -287,7 +288,8 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
            Prevents oversubscription when hashing a single medium file */
         size_t task_size = (size_t)B3P_DEFAULT_SUBTREE_CHUNKS * BLAKE3_CHUNK_LEN;
         size_t num_tasks = ((size_t)ctx.size + task_size - 1) / task_size;
-        if (num_tasks < 1) num_tasks = 1;
+        if (num_tasks < 1)
+            num_tasks = 1;
         if ((size_t)nthreads > num_tasks) {
             nthreads = (int)num_tasks;
         }
@@ -296,7 +298,8 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
 
         b3p_ctx_t* b3p = b3p_create(&cfg);
         if (!b3p) {
-            if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
+            if (ctx.map)
+                munmap((void*)ctx.map, ctx.map_len);
             errno = ENOMEM;
             return -1;
         }
@@ -304,7 +307,8 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         int rc = b3p_hash_one_shot(b3p, input_buf, (size_t)ctx.size, iv_bytes, 0, B3P_METHOD_AUTO, out_hash, BLAKE3_OUT_LEN);
         b3p_destroy(b3p);
 
-        if (ctx.map) munmap((void*)ctx.map, ctx.map_len);
+        if (ctx.map)
+            munmap((void*)ctx.map, ctx.map_len);
 
         if (rc != 0) {
             errno = EIO;
@@ -341,26 +345,21 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
    Fast producer enqueue using CAS on q_tail
    Wakes sleepers only when needed */
 static int enqueue_task_lockfree(file_task* t) {
-    for (;;) {
-        size_t tail = atomic_load_explicit(&q_tail, memory_order_relaxed);
-        size_t head = atomic_load_explicit(&q_head, memory_order_acquire);
+    size_t tail = atomic_load_explicit(&q_tail, memory_order_relaxed);
+    size_t head = atomic_load_explicit(&q_head, memory_order_acquire);
 
-        if ((tail - head) >= TASKQ_CAP)
-            return -1;
+    if ((tail - head) >= TASKQ_CAP)
+        return -1;
 
-        if (atomic_compare_exchange_weak_explicit(&q_tail, &tail, tail + 1, memory_order_acq_rel, memory_order_relaxed)) {
-            task_ring[tail & TASKQ_MASK] = t;
+    task_ring[tail & TASKQ_MASK] = t;
+    atomic_store_explicit(&q_tail, tail + 1, memory_order_release);
 
-            if (atomic_load_explicit(&q_sleep_counter, memory_order_relaxed) > 0) {
-                pthread_mutex_lock(&q_sleep_mutex);
-                pthread_cond_broadcast(&q_sleep_cond);
-                pthread_mutex_unlock(&q_sleep_mutex);
-            }
-            return 0;
-        }
-
-        cpu_relax();
+    if (atomic_load_explicit(&q_sleep_counter, memory_order_relaxed) > 0) {
+        pthread_mutex_lock(&q_sleep_mutex);
+        pthread_cond_broadcast(&q_sleep_cond);
+        pthread_mutex_unlock(&q_sleep_mutex);
     }
+    return 0;
 }
 
 /* enqueue_task
@@ -449,20 +448,10 @@ static int handle_options(int argc, char** argv, program_opts* opts) {
     memset(opts, 0, sizeof(*opts));
     opts->jobs = 0;
 
-    static const struct option long_opts[] = {
-        {"check", no_argument, NULL, 'c'},
-        {"tag", no_argument, NULL, 't'},
-        {"zero", no_argument, NULL, 'z'},
-        {"ignore-missing", no_argument, NULL, 'i'},
-        {"quiet", no_argument, NULL, 'q'},
-        {"status", no_argument, NULL, 's'},
-        {"strict", no_argument, NULL, 'S'},
-        {"warn", no_argument, NULL, 'w'},
-        {"jobs", required_argument, NULL, 'j'},
-        {"help", no_argument, NULL, 'h'},
-        {"version", no_argument, NULL, 'v'},
-        {0, 0, 0, 0}
-    };
+    static const struct option long_opts[] = {{"check", no_argument, NULL, 'c'},          {"tag", no_argument, NULL, 't'},     {"zero", no_argument, NULL, 'z'},
+                                              {"ignore-missing", no_argument, NULL, 'i'}, {"quiet", no_argument, NULL, 'q'},   {"status", no_argument, NULL, 's'},
+                                              {"strict", no_argument, NULL, 'S'},         {"warn", no_argument, NULL, 'w'},    {"jobs", required_argument, NULL, 'j'},
+                                              {"help", no_argument, NULL, 'h'},           {"version", no_argument, NULL, 'v'}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "ctziqsSwj:hv", long_opts, NULL)) != -1) {
@@ -531,7 +520,8 @@ static char* unescape_filename(const char* in) {
                 out[j++] = '\n';
                 i += 2;
                 continue;
-            } else if (next == '\\') {
+            }
+            else if (next == '\\') {
                 out[j++] = '\\';
                 i += 2;
                 continue;
@@ -590,7 +580,7 @@ static int parse_hex_hash(const char* hex, uint8_t* out) {
         unsigned char a = hex[2 * i], b = hex[2 * i + 1];
         if (!isxdigit(a) || !isxdigit(b))
             return -1;
-        char tmp[3] = { (char)a, (char)b, 0 };
+        char tmp[3] = {(char)a, (char)b, 0};
         unsigned long v = strtoul(tmp, NULL, 16);
         if (v > 0xFF)
             return -1;
@@ -707,7 +697,7 @@ static int hash_fd_stream_with_buffer(int fd, off_t filesize, uint8_t* output, u
     for (;;) {
         ssize_t r;
 #if HAVE_PREADV2_NOWAIT
-        struct iovec iov = { .iov_base = buf, .iov_len = buf_sz };
+        struct iovec iov = {.iov_base = buf, .iov_len = buf_sz};
         r = preadv2(fd, &iov, 1, -1, RWF_NOWAIT);
         if (r < 0) {
             r = read(fd, buf, buf_sz);
@@ -772,7 +762,8 @@ static void enqueue_task_hash_stat(const char* filename, const struct stat* st_o
     if (st_opt) {
         t->st = *st_opt;
         t->have_stat = 1;
-    } else {
+    }
+    else {
         memset(&t->st, 0, sizeof(t->st));
         t->have_stat = 0;
     }
@@ -935,7 +926,8 @@ static void* worker_main(void* arg) {
             if (fstat(STDIN_FILENO, &stin) != 0) {
                 rc = -1;
                 saved_errno = errno;
-            } else {
+            }
+            else {
                 rc = hash_fd_stream_fast(STDIN_FILENO, stin.st_size, out);
                 if (rc != 0)
                     saved_errno = errno;
@@ -946,17 +938,19 @@ static void* worker_main(void* arg) {
                 if (rc == 0 && memcmp(t->expected_hash, out, BLAKE3_OUT_LEN) == 0) {
                     if (!opts->quiet && !opts->status)
                         printf("%s: OK\n", name);
-                } else {
-                    any_failure_global = 1;
+                }
+                else {
+                    atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
                     if (!opts->status)
                         printf("%s: FAILED\n", name);
                 }
-            } else {
+            }
+            else {
                 if (rc == 0 && !opts->status)
                     print_hash(out, name, opts->tag, opts->zero);
                 else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
                     fprintf(stderr, "b3sum: %s: %s\n", name, strerror(saved_errno));
-                    any_failure_global = 1;
+                    atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
                 }
             }
             pthread_mutex_unlock(&output_mutex);
@@ -975,7 +969,8 @@ static void* worker_main(void* arg) {
         if (fd < 0) {
             rc = -1;
             saved_errno = errno;
-        } else {
+        }
+        else {
             struct stat st_local;
             const struct stat* stp = t->have_stat ? &t->st : NULL;
 
@@ -991,7 +986,8 @@ static void* worker_main(void* arg) {
             if (rc == 0 && stp) {
                 if (S_ISREG(stp->st_mode)) {
                     rc = hash_regular_file_parallel(opts, name, fd, stp, out);
-                } else {
+                }
+                else {
                     rc = hash_fd_stream_fast(fd, stp->st_size, out);
                 }
                 if (rc != 0)
@@ -1007,17 +1003,19 @@ static void* worker_main(void* arg) {
             if (ok) {
                 if (!opts->quiet && !opts->status)
                     printf("%s: OK\n", name);
-            } else {
-                any_failure_global = 1;
+            }
+            else {
+                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
                 if (!opts->status)
                     printf("%s: FAILED\n", name);
             }
-        } else {
+        }
+        else {
             if (rc == 0 && !opts->status)
                 print_hash(out, name, opts->tag, opts->zero);
             else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
                 fprintf(stderr, "b3sum: %s: %s\n", name, strerror(saved_errno));
-                any_failure_global = 1;
+                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
             }
         }
         pthread_mutex_unlock(&output_mutex);
@@ -1076,18 +1074,19 @@ static int process_check_files_multithread(int fc, char** files, const program_o
                 if (opts->warn)
                     fputs("b3sum: warning: invalid line in checksum input\n", stderr);
                 if (opts->strict)
-                    any_format_error_global = 1;
+                    atomic_store_explicit(&any_format_error_global, 1, memory_order_relaxed);
                 continue;
             }
             enqueue_task_check(fname, expected);
             free(fname);
         }
-    } else {
+    }
+    else {
         for (int i = 0; i < fc; i++) {
             FILE* f = (strcmp(files[i], "-") == 0) ? stdin : fopen(files[i], "r");
             if (!f) {
                 fprintf(stderr, "b3sum: %s: %s\n", files[i], strerror(errno));
-                any_failure_global = 1;
+                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
                 continue;
             }
 
@@ -1098,7 +1097,7 @@ static int process_check_files_multithread(int fc, char** files, const program_o
                     if (opts->warn)
                         fputs("b3sum: warning: invalid line in checksum input\n", stderr);
                     if (opts->strict)
-                        any_format_error_global = 1;
+                        atomic_store_explicit(&any_format_error_global, 1, memory_order_relaxed);
                     continue;
                 }
                 enqueue_task_check(fname, expected);
@@ -1119,7 +1118,7 @@ static int process_check_files_multithread(int fc, char** files, const program_o
 
     run_pool_and_wait(opts);
 
-    return (any_failure_global || (any_format_error_global && opts->strict)) ? 1 : 0;
+    return (atomic_load_explicit(&any_failure_global, memory_order_relaxed) || (atomic_load_explicit(&any_format_error_global, memory_order_relaxed) && opts->strict)) ? 1 : 0;
 }
 
 typedef struct {
@@ -1181,5 +1180,5 @@ int main(int argc, char** argv) {
     run_pool_and_wait(&opts);
     pthread_join(prod, NULL);
 
-    return any_failure_global ? EXIT_FAILURE : EXIT_SUCCESS;
+    return atomic_load_explicit(&any_failure_global, memory_order_relaxed) ? EXIT_FAILURE : EXIT_SUCCESS;
 }
