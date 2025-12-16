@@ -24,6 +24,28 @@ typedef struct {
 #include <stdio.h>
 
 #define DEBUG_PARALLEL 0
+#define CACHE_LINE_SIZE 64
+
+/* Try to use C11 alignment, fallback for older compilers */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#include <stdalign.h>
+#else
+#define alignas(x) __attribute__((aligned(x)))
+#endif
+
+static inline size_t next_power_of_2(size_t x) {
+    if (x == 0)
+        return 1;
+    x--;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    if (sizeof(size_t) > 4)
+        x |= x >> 32;
+    return x + 1;
+}
 
 /* Thread-local CV scratch
    Avoids per-task malloc and avoids alloca in deep or repeated calls
@@ -143,7 +165,9 @@ typedef struct {
 
 typedef struct {
     struct b3p_ctx* ctx;
-    atomic_size_t next_chunk;
+    /* CACHE LINE PADDING START */
+    alignas(CACHE_LINE_SIZE) atomic_size_t next_chunk;
+    /* CACHE LINE PADDING END */
     size_t end_chunk;
     size_t batch_step;
     b3_cv_bytes_t* out_cvs;
@@ -153,7 +177,9 @@ typedef struct {
 typedef struct {
     struct b3p_ctx* ctx;
     size_t subtree_chunks;
-    atomic_size_t next_subtree;
+    /* CACHE LINE PADDING START */
+    alignas(CACHE_LINE_SIZE) atomic_size_t next_subtree;
+    /* CACHE LINE PADDING END */
     size_t num_subtrees;
     b3_cv_bytes_t* out_subtree_cvs;
     b3_cv_bytes_t* out_split_children;
@@ -262,6 +288,7 @@ b3p_ctx_t* b3p_create(const b3p_config_t* cfg) {
     // This avoids mutex/cond overhead and keeps serial one-shot fast
     if (nthreads > 1) {
         // Keep the queue small to reduce memory while allowing slight burstiness
+        // Enforce a power of 2 for queue efficiency
         size_t qcap = nthreads * 2;
 
         // Guard against size_t overflow on multiplication
@@ -269,10 +296,10 @@ b3p_ctx_t* b3p_create(const b3p_config_t* cfg) {
             qcap = nthreads;
         }
 
-        // Enforce a minimum capacity so producer/consumer signaling works predictably
-        if (qcap < 2) {
+        // Force queue capacity to next power of 2 for fast bitwise indexing
+        qcap = next_power_of_2(qcap);
+        if (qcap < 2)
             qcap = 2;
-        }
 
         // Initialize the pool, freeing the context if it fails
         if (b3p_pool_init(&ctx->pool, nthreads, qcap) != 0) {
@@ -441,6 +468,11 @@ static int b3p_pool_init(b3p_pool_t* p, size_t nthreads, size_t qcap) {
     if (qcap == 0) {
         qcap = 256;
     }
+
+    // Force queue capacity to next power of 2 for fast bitwise indexing
+    qcap = next_power_of_2(qcap);
+    if (qcap < 2)
+        qcap = 2;
 
     // Treat 0 threads as "auto"
     if (nthreads == 0) {
@@ -635,7 +667,7 @@ static int b3p_pool_submit(b3p_pool_t* p, b3p_taskgroup_t* g, b3p_task_fn fn, vo
     t->group = g;
 
     // Advance tail and increase count
-    p->q.tail = (p->q.tail + 1) % p->q.cap;
+    p->q.tail = (p->q.tail + 1) & (p->q.cap - 1);
     p->q.count++;
 
     // Wake one worker waiting for a task
@@ -663,6 +695,9 @@ static void* b3p_worker_main(void* arg) {
     // Each worker services the shared pool queue
     b3p_pool_t* p = (b3p_pool_t*)arg;
 
+    // Mask for queue wrapping (cap is power of 2)
+    const size_t wrap_mask = p->q.cap - 1;
+
     for (;;) {
         // Local copy so we can run the task outside the queue lock
         b3p_task_t t = (b3p_task_t){0};
@@ -681,7 +716,7 @@ static void* b3p_worker_main(void* arg) {
 
         // Remove the task from the head of the ring buffer
         t = p->q.buf[p->q.head];
-        p->q.head = (p->q.head + 1) % p->q.cap;
+        p->q.head = (p->q.head + 1) & wrap_mask;
         p->q.count--;
 
         // Wake a producer waiting for space
@@ -839,7 +874,7 @@ static void b3p_task_hash_chunks(void* arg) {
 
     // Local buffer sized for the common-case maximum batch
     // Keeps per-batch CVs on the stack, avoiding heap traffic
-    b3_cv_bytes_t local_buf[1024];
+    b3_cv_bytes_t local_buf[64];
 
     for (;;) {
         // Claim the next batch range atomically
