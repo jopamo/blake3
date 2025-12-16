@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -71,8 +72,31 @@ static __thread size_t tls_io_buf_cap = 0;
    Keep the lock held only during printing */
 static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Thread‑local output buffer for batching print calls
+   Each thread accumulates formatted lines here and flushes them under the mutex */
+static __thread char* tls_out_buf = NULL;
+static __thread size_t tls_out_cap = 0;
+static __thread size_t tls_out_len = 0;
+
+/* Program options
+   Stored as ints for easy zero-init */
+typedef struct {
+    int check;           // verify hashes instead of printing
+    int tag;             // include BLAKE3 tag header
+    int zero;            // use null byte terminator
+    int ignore_missing;  // skip missing files silently
+    int quiet;           // suppress normal output
+    int status;          // exit nonzero if mismatch
+    int strict;          // reject malformed inputs
+    int warn;            // print warnings on parse errors
+    int jobs;            // number of worker threads (0 = auto)
+} program_opts;
+
 /* Forward declarations */
 static int blake3_hash_region_tree(const uint8_t* data, size_t len, uint8_t out_hash[BLAKE3_OUT_LEN]);
+static void print_hash_buffered(const uint8_t* hash, const char* filename, int tag, int zero);
+static void append_result_to_buffer(const uint8_t* hash, const char* filename, int is_check_mode, const uint8_t* expected, const program_opts* opts, int rc, int saved_errno);
+static int process_paths_parallel_tiny(const program_opts* opts, char** files, int fc);
 
 /* Thread-local buffer helpers */
 
@@ -121,19 +145,82 @@ static void release_tls_io_buffer(void) {
     tls_io_buf_cap = 0;
 }
 
-/* Program options
-   Stored as ints for easy zero-init */
-typedef struct {
-    int check;           // verify hashes instead of printing
-    int tag;             // include BLAKE3 tag header
-    int zero;            // use null byte terminator
-    int ignore_missing;  // skip missing files silently
-    int quiet;           // suppress normal output
-    int status;          // exit nonzero if mismatch
-    int strict;          // reject malformed inputs
-    int warn;            // print warnings on parse errors
-    int jobs;            // number of worker threads (0 = auto)
-} program_opts;
+/* Thread‑local output buffer helpers */
+
+/* ensure_tls_out_buffer
+   Ensures the calling thread has an output buffer of at least min_bytes */
+static int ensure_tls_out_buffer(size_t min_bytes) {
+    if (min_bytes <= tls_out_cap)
+        return 0;
+
+    size_t newcap = (min_bytes + 4095) & ~(size_t)4095; /* round up to 4 KiB */
+    char* newbuf = realloc(tls_out_buf, newcap);
+    if (!newbuf)
+        return -1;
+
+    tls_out_buf = newbuf;
+    tls_out_cap = newcap;
+    return 0;
+}
+
+/* tls_out_append
+   Appends formatted data to the thread‑local output buffer.
+   Flushes automatically if the buffer would exceed capacity. */
+static void tls_out_append(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0)
+        return;
+
+    size_t required = tls_out_len + (size_t)needed + 1; /* +1 for safety */
+    if (ensure_tls_out_buffer(required) != 0)
+        return; /* out of memory – drop output */
+
+    va_start(ap, fmt);
+    int written = vsnprintf(tls_out_buf + tls_out_len, tls_out_cap - tls_out_len, fmt, ap);
+    va_end(ap);
+    if (written > 0)
+        tls_out_len += (size_t)written;
+}
+
+/* tls_out_append_raw
+   Appends raw bytes to the thread‑local output buffer. */
+static void tls_out_append_raw(const char* data, size_t len) {
+    if (len == 0)
+        return;
+    if (ensure_tls_out_buffer(tls_out_len + len) != 0)
+        return;
+    memcpy(tls_out_buf + tls_out_len, data, len);
+    tls_out_len += len;
+}
+
+/* tls_out_append_str
+   Appends a null‑terminated string. */
+static void tls_out_append_str(const char* str) {
+    tls_out_append_raw(str, strlen(str));
+}
+
+/* tls_out_flush
+   Writes the thread‑local buffer to stdout under the output mutex */
+static void tls_out_flush(void) {
+    if (tls_out_len == 0)
+        return;
+    pthread_mutex_lock(&output_mutex);
+    fwrite(tls_out_buf, 1, tls_out_len, stdout);
+    pthread_mutex_unlock(&output_mutex);
+    tls_out_len = 0;
+}
+
+/* release_tls_out_buffer
+   Frees the calling thread's output buffer */
+static void release_tls_out_buffer(void) {
+    free(tls_out_buf);
+    tls_out_buf = NULL;
+    tls_out_cap = 0;
+    tls_out_len = 0;
+}
 
 /* Aggregated results
    Updated by workers, read by main */
@@ -450,6 +537,72 @@ static void print_hash(const uint8_t* hash, const char* filename, int tag, int z
     putchar('\n');
 }
 
+static void print_hash_buffered(const uint8_t* hash, const char* filename, int tag, int zero) {
+    if (tag)
+        tls_out_append_str("BLAKE3 ");
+
+    char hex[BLAKE3_OUT_LEN * 2 + 1];
+    for (size_t i = 0; i < BLAKE3_OUT_LEN; i++)
+        snprintf(hex + i * 2, 3, "%02x", hash[i]);
+    tls_out_append_str(hex);
+
+    if (zero) {
+        tls_out_append_str("  ");
+        tls_out_append_str(*filename ? filename : "-");
+        tls_out_append_raw("\0", 1);
+        return;
+    }
+
+    int needs_escape = 0;
+    for (const char* p = filename; *p; ++p) {
+        if (*p == '\n' || *p == '\\') {
+            needs_escape = 1;
+            break;
+        }
+    }
+
+    if (needs_escape)
+        tls_out_append_raw("\\", 1);
+
+    tls_out_append_str("  ");
+
+    for (const char* p = filename; *p; ++p) {
+        if (*p == '\\')
+            tls_out_append_str("\\\\");
+        else if (*p == '\n')
+            tls_out_append_str("\\n");
+        else
+            tls_out_append_raw(p, 1);
+    }
+
+    tls_out_append_raw("\n", 1);
+}
+
+static void append_result_to_buffer(const uint8_t* hash, const char* filename, int is_check_mode, const uint8_t* expected, const program_opts* opts, int rc, int saved_errno) {
+    if (is_check_mode) {
+        int ok = (rc == 0 && memcmp(expected, hash, BLAKE3_OUT_LEN) == 0);
+        if (ok) {
+            if (!opts->quiet && !opts->status)
+                tls_out_append("%s: OK\n", filename);
+        }
+        else {
+            if (!opts->status)
+                tls_out_append("%s: FAILED\n", filename);
+        }
+    }
+    else {
+        if (rc == 0 && !opts->status) {
+            print_hash_buffered(hash, filename, opts->tag, opts->zero);
+        }
+        else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
+            /* Error message – we output directly to stderr under the mutex */
+            pthread_mutex_lock(&output_mutex);
+            fprintf(stderr, "b3sum: %s: %s\n", filename, strerror(saved_errno));
+            pthread_mutex_unlock(&output_mutex);
+        }
+    }
+}
+
 /* parse_hex_hash
    Decodes a 64-char hex string into 32 bytes */
 static int parse_hex_hash(const char* hex, uint8_t* out) {
@@ -615,7 +768,7 @@ static int hash_fd_stream_fast(int fd, off_t filesize, uint8_t* output) {
 
     return hash_fd_stream_with_buffer(fd, filesize, output, buf, buf_sz);
 }
-static int process_one_path(const program_opts* opts, const char* path, int is_check_mode, const uint8_t expected[BLAKE3_OUT_LEN]) {
+static int process_one_path(const program_opts* opts, const char* path, int is_check_mode, const uint8_t expected[BLAKE3_OUT_LEN], int buffered) {
     uint8_t out[BLAKE3_OUT_LEN];
     const char* name = path ? path : "-";
 
@@ -666,29 +819,53 @@ static int process_one_path(const program_opts* opts, const char* path, int is_c
         }
     }
 
-    pthread_mutex_lock(&output_mutex);
-    if (is_check_mode) {
-        int ok = (rc == 0 && memcmp(expected, out, BLAKE3_OUT_LEN) == 0);
-        if (ok) {
-            if (!opts->quiet && !opts->status)
-                printf("%s: OK\n", name);
+    if (buffered) {
+        /* Buffered output – append to thread‑local buffer, no mutex */
+        if (is_check_mode) {
+            int ok = (rc == 0 && memcmp(expected, out, BLAKE3_OUT_LEN) == 0);
+            if (!ok)
+                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
+            append_result_to_buffer(out, name, is_check_mode, expected, opts, rc, saved_errno);
         }
         else {
-            atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
-            if (!opts->status)
-                printf("%s: FAILED\n", name);
+            if (rc == 0 && !opts->status) {
+                print_hash_buffered(out, name, opts->tag, opts->zero);
+            }
+            else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
+                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
+                /* Error message – we output directly to stderr under the mutex */
+                pthread_mutex_lock(&output_mutex);
+                fprintf(stderr, "b3sum: %s: %s\n", name, strerror(saved_errno));
+                pthread_mutex_unlock(&output_mutex);
+            }
         }
     }
     else {
-        if (rc == 0 && !opts->status) {
-            print_hash(out, name, opts->tag, opts->zero);
+        /* Original synchronized output */
+        pthread_mutex_lock(&output_mutex);
+        if (is_check_mode) {
+            int ok = (rc == 0 && memcmp(expected, out, BLAKE3_OUT_LEN) == 0);
+            if (ok) {
+                if (!opts->quiet && !opts->status)
+                    printf("%s: OK\n", name);
+            }
+            else {
+                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
+                if (!opts->status)
+                    printf("%s: FAILED\n", name);
+            }
         }
-        else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
-            fprintf(stderr, "b3sum: %s: %s\n", name, strerror(saved_errno));
-            atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
+        else {
+            if (rc == 0 && !opts->status) {
+                print_hash(out, name, opts->tag, opts->zero);
+            }
+            else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
+                fprintf(stderr, "b3sum: %s: %s\n", name, strerror(saved_errno));
+                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
+            }
         }
+        pthread_mutex_unlock(&output_mutex);
     }
-    pthread_mutex_unlock(&output_mutex);
 
     return rc;
 }
@@ -707,7 +884,7 @@ static int process_check_files_serial(int fc, char** files, const program_opts* 
                     atomic_store_explicit(&any_format_error_global, 1, memory_order_relaxed);
                 continue;
             }
-            process_one_path(opts, fname, 1, expected);
+            process_one_path(opts, fname, 1, expected, 0);
             free(fname);
         }
     }
@@ -729,7 +906,7 @@ static int process_check_files_serial(int fc, char** files, const program_opts* 
                         atomic_store_explicit(&any_format_error_global, 1, memory_order_relaxed);
                     continue;
                 }
-                process_one_path(opts, fname, 1, expected);
+                process_one_path(opts, fname, 1, expected, 0);
                 free(fname);
             }
             if (f != stdin)
@@ -741,6 +918,80 @@ static int process_check_files_serial(int fc, char** files, const program_opts* 
 
     return (atomic_load_explicit(&any_failure_global, memory_order_relaxed) || (atomic_load_explicit(&any_format_error_global, memory_order_relaxed) && opts->strict)) ? 1 : 0;
 }
+
+typedef struct {
+    const program_opts* opts;
+    char** files;
+    size_t nfiles;
+    _Atomic size_t* next_index;
+} worker_ctx_t;
+
+static void* tiny_worker(void* arg) {
+    worker_ctx_t* ctx = (worker_ctx_t*)arg;
+    size_t i;
+    while (1) {
+        i = atomic_fetch_add(ctx->next_index, 1);
+        if (i >= ctx->nfiles)
+            break;
+        process_one_path(ctx->opts, ctx->files[i], 0, NULL, 1);
+        /* Flush thread‑local output buffer if it's large enough */
+        if (tls_out_len >= 65536)
+            tls_out_flush();
+    }
+    tls_out_flush();
+    release_tls_out_buffer();
+    return NULL;
+}
+
+static int process_paths_parallel_tiny(const program_opts* opts, char** files, int fc) {
+    size_t nfiles = (size_t)fc;
+    static _Atomic size_t next_index = 0;
+    int nthreads = opts->jobs;
+    if (nthreads == 0) {
+        int avail = get_nprocs();
+        nthreads = (fc < avail) ? fc : avail;
+    }
+    if (nthreads < 1)
+        nthreads = 1;
+    if ((size_t)nthreads > nfiles)
+        nthreads = (int)nfiles;
+
+    worker_ctx_t ctx = {
+        .opts = opts,
+        .files = files,
+        .nfiles = nfiles,
+        .next_index = &next_index,
+    };
+
+    pthread_t* threads = malloc((size_t)nthreads * sizeof(pthread_t));
+    if (!threads)
+        return -1;
+
+    atomic_store_explicit(&next_index, 0, memory_order_relaxed);
+
+    int t;
+    for (t = 0; t < nthreads; t++) {
+        if (pthread_create(&threads[t], NULL, tiny_worker, &ctx) != 0)
+            break;
+    }
+
+    if (t < nthreads) {
+        /* Some thread creation failed – stop all workers */
+        atomic_store_explicit(&next_index, nfiles, memory_order_relaxed);
+        for (int j = 0; j < t; j++)
+            pthread_join(threads[j], NULL);
+        free(threads);
+        return -1;
+    }
+
+    for (int j = 0; j < nthreads; j++) {
+        pthread_join(threads[j], NULL);
+    }
+
+    free(threads);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     program_opts opts;
     int argi = handle_options(argc, argv, &opts);
@@ -765,10 +1016,21 @@ int main(int argc, char** argv) {
         fc = 1;
     }
 
-    for (int i = 0; i < fc; i++) {
-        process_one_path(&opts, files[i], 0, NULL);
+    if (fc >= 64 && opts.jobs != 1) {
+        if (process_paths_parallel_tiny(&opts, files, fc) != 0) {
+            /* fall back to serial processing */
+            for (int i = 0; i < fc; i++) {
+                process_one_path(&opts, files[i], 0, NULL, 0);
+            }
+        }
+    }
+    else {
+        for (int i = 0; i < fc; i++) {
+            process_one_path(&opts, files[i], 0, NULL, 0);
+        }
     }
 
+    release_tls_out_buffer();
     release_tls_io_buffer();
     b3p_free_tls_resources();
 
