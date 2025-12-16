@@ -14,6 +14,13 @@ static int g_fail_realloc_at = -1;
 static int g_realloc_count = 0;
 static int g_fail_pthread_create = 0;
 static int g_alloc_count = 0;  // Malloc/Calloc/Realloc total
+static size_t g_simd_degree_result = 1;
+static int g_chunk_cv_calls = 0;
+static int g_hash_many_calls = 0;
+static int g_parent_cv_calls = 0;
+static uint8_t g_parent_cv_flags[32] = {0};
+static const uint8_t* g_parent_cv_left[32] = {0};
+static const uint8_t* g_parent_cv_right[32] = {0};
 
 void* my_realloc(void* ptr, size_t size) {
     g_alloc_count++;
@@ -67,19 +74,41 @@ void blake3_hash_many(const uint8_t* const* inputs,
                       uint8_t flags,
                       uint8_t flags_start,
                       uint8_t flags_end,
-                      uint8_t* out) {}
+                      uint8_t* out) {
+    g_hash_many_calls++;
+}
 size_t blake3_simd_degree(void) {
-    return 1;
+    return g_simd_degree_result;
 }
 
 // Internal primitives stubs
-void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t* chunk, size_t chunk_len, uint64_t chunk_index, bool is_root, uint8_t out_cv[32]) {}
-void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t left_cv[32], const uint8_t right_cv[32], uint8_t out_cv[32]) {}
+void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t* chunk, size_t chunk_len, uint64_t chunk_index, bool is_root, uint8_t out_cv[32]) {
+    g_chunk_cv_calls++;
+}
+void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t left_cv[32], const uint8_t right_cv[32], uint8_t out_cv[32]) {
+    if (g_parent_cv_calls < 32) {
+        g_parent_cv_flags[g_parent_cv_calls] = flags;
+        g_parent_cv_left[g_parent_cv_calls] = left_cv;
+        g_parent_cv_right[g_parent_cv_calls] = right_cv;
+    }
+    g_parent_cv_calls++;
+    // Compute output as XOR of left and right (deterministic, associative)
+    for (int i = 0; i < 32; i++) {
+        out_cv[i] = left_cv[i] ^ right_cv[i];
+    }
+}
 void b3_output_root_impl(const uint32_t input_cv[8], uint8_t block_flags, const uint8_t* block, size_t block_len, uint64_t counter, uint64_t seek, uint8_t* out, size_t out_len) {}
 
 // Dummy task for testing
 static void dummy_task(void* arg) {
     // Do nothing
+}
+
+// Helper to merge two CVs using XOR (matches stub b3_hash_parent_cv_impl)
+static void xor_merge(const b3_cv_bytes_t* left, const b3_cv_bytes_t* right, b3_cv_bytes_t* out) {
+    for (int i = 0; i < 32; i++) {
+        out->bytes[i] = left->bytes[i] ^ right->bytes[i];
+    }
 }
 
 // Helper for heuristic tests
@@ -674,6 +703,241 @@ void test_subtree_hashing_job(void) {
     printf("OK\n");
 }
 
+void test_range_hashing_core(void) {
+    printf("Testing range hashing core edge cases...\n");
+
+    // Helper to create a minimal context
+    struct b3p_ctx* ctx = create_test_ctx();
+    assert(ctx != NULL);
+
+    // Default input length 1024, chunk len 1024? Actually BLAKE3_CHUNK_LEN is 1024.
+    // Ensure we have at least one chunk.
+    ctx->input_len = 1024;
+    ctx->num_chunks = 1;
+
+    // Temporary buffers
+    b3_cv_bytes_t tmp[16];
+    b3_cv_bytes_t out_root[1];
+
+    // 1. Null guards
+    b3p_hash_range_to_root(NULL, 0, 1, tmp, out_root, 0, NULL);
+    b3p_hash_range_to_root(ctx, 0, 1, NULL, out_root, 0, NULL);
+    b3p_hash_range_to_root(ctx, 0, 1, tmp, NULL, 0, NULL);
+    // Should not crash
+
+    // 2. Invalid range (end < start)
+    b3p_hash_range_to_root(ctx, 5, 3, tmp, out_root, 0, NULL);
+
+    // 3. Zero-length range (start == end)
+    b3p_hash_range_to_root(ctx, 7, 7, tmp, out_root, 0, NULL);
+
+    // 4. SIMD degree clamping: zero degree
+    g_simd_degree_result = 0;
+    b3p_hash_range_to_root(ctx, 0, 1, tmp, out_root, 0, NULL);
+    // Should clamp to 1, no crash
+    g_simd_degree_result = 17;  // assuming MAX_SIMD_DEGREE is 16
+    b3p_hash_range_to_root(ctx, 0, 1, tmp, out_root, 0, NULL);
+    // Should clamp to 16, no crash
+    g_simd_degree_result = 1;  // restore
+
+    // 5. Last chunk partial (input length less than chunk)
+    ctx->input_len = 500;  // less than CHUNK_LEN
+    ctx->num_chunks = 1;
+    g_chunk_cv_calls = 0;
+    g_hash_many_calls = 0;
+    b3p_hash_range_to_root(ctx, 0, 1, tmp, out_root, 0, NULL);
+    assert(g_chunk_cv_calls == 1);
+    assert(g_hash_many_calls == 0);
+    ctx->input_len = 1024;  // restore
+
+    // 6. Multiplication overflow start offset guard
+    size_t max_chunks = SIZE_MAX / BLAKE3_CHUNK_LEN;
+    b3p_hash_range_to_root(ctx, max_chunks + 1, max_chunks + 2, tmp, out_root, 0, NULL);
+    // Should return early
+
+    // 7. Input bounds guard
+    ctx->input_len = 100;
+    b3p_hash_range_to_root(ctx, 1, 2, tmp, out_root, 0, NULL);  // start_off = 1024 > 100
+    ctx->input_len = 1024;
+
+    // Additional overflow guard for chunk_i
+    // chunk_i overflow when chunk_start + i + j > SIZE_MAX / CHUNK_LEN
+    // Hard to trigger; skip.
+
+    // Additional overflow guard for count
+    // count > SIZE_MAX / CHUNK_LEN (simd_degree could be huge)
+    // but simd_degree is clamped to MAX_SIMD_DEGREE (16). So cannot test.
+
+    free(ctx);
+    printf("OK\n");
+}
+
+void test_reduction_functions(void) {
+    printf("Testing reduction functions...\n");
+
+#define RESET_PARENT_CV_CALLS()                                  \
+    do {                                                         \
+        g_parent_cv_calls = 0;                                   \
+        memset(g_parent_cv_flags, 0, sizeof(g_parent_cv_flags)); \
+        memset(g_parent_cv_left, 0, sizeof(g_parent_cv_left));   \
+        memset(g_parent_cv_right, 0, sizeof(g_parent_cv_right)); \
+    } while (0)
+
+    struct b3p_ctx* ctx = create_test_ctx();
+    assert(ctx != NULL);
+    ctx->num_chunks = 100;
+
+    b3_cv_bytes_t cvs[10];
+    b3_cv_bytes_t out_root = {0};
+    b3_cv_bytes_t split_children[2] = {0};
+
+    RESET_PARENT_CV_CALLS();
+    b3p_reduce_stack(NULL, cvs, 5, 1, 5, &out_root, 0, NULL);
+    assert(g_parent_cv_calls == 0);
+    b3p_reduce_stack(ctx, NULL, 5, 1, 5, &out_root, 0, NULL);
+    assert(g_parent_cv_calls == 0);
+    b3p_reduce_stack(ctx, cvs, 5, 1, 5, NULL, 0, NULL);
+    assert(g_parent_cv_calls == 0);
+    printf("  Reduce_NullGuards passed\n");
+
+    RESET_PARENT_CV_CALLS();
+    b3p_reduce_stack(ctx, cvs, 0, 1, 0, &out_root, 0, NULL);
+    assert(g_parent_cv_calls == 0);
+    printf("  Reduce_NZero_Returns passed\n");
+
+    RESET_PARENT_CV_CALLS();
+    b3p_reduce_stack(ctx, cvs, 5, 0, 0, &out_root, 0, NULL);
+    assert(g_parent_cv_calls == 0);
+    printf("  Reduce_SubtreeChunksZero_Returns passed\n");
+
+    RESET_PARENT_CV_CALLS();
+    size_t huge = SIZE_MAX - 5;
+    b3p_reduce_stack(ctx, cvs, 2, huge, ctx->num_chunks, &out_root, 0, NULL);
+    assert(g_parent_cv_calls == 0);
+    printf("  Reduce_TotalCountOverflowGuard passed\n");
+
+    srand(42);
+    for (int i = 0; i < 10; i++) {
+        for (int j = 0; j < 32; j++) {
+            cvs[i].bytes[j] = rand() & 0xFF;
+        }
+    }
+
+    b3_cv_bytes_t orig_cvs[10];
+    for (int i = 0; i < 10; i++) {
+        orig_cvs[i] = cvs[i];
+    }
+
+    b3_cv_bytes_t expected = {0};
+    for (int i = 0; i < 10; i++) {
+        for (int j = 0; j < 32; j++) {
+            expected.bytes[j] ^= orig_cvs[i].bytes[j];
+        }
+    }
+
+    RESET_PARENT_CV_CALLS();
+    b3p_reduce_stack(ctx, cvs, 10, 1, 10, &out_root, 1, NULL);
+    if (memcmp(out_root.bytes, expected.bytes, 32) != 0) {
+        printf("MISMATCH in Reduce_LazyMergePreservesTreeShape\n");
+        printf("Expected: ");
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", expected.bytes[j]);
+        }
+        printf("\nGot:      ");
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", out_root.bytes[j]);
+        }
+        printf("\n");
+        fflush(stdout);
+        assert(0);
+    }
+    assert(g_parent_cv_calls == 9);
+    printf("  Reduce_LazyMergePreservesTreeShape passed\n");
+
+    for (int i = 0; i < 10; i++) {
+        cvs[i] = orig_cvs[i];
+    }
+
+    const size_t subtree_chunks = 8;
+    const size_t n_cvs = 10;
+    const size_t remainder = 5;
+    const size_t total_chunks = (n_cvs - 1) * subtree_chunks + remainder;
+    size_t saved_num_chunks = ctx->num_chunks;
+    ctx->num_chunks = total_chunks;
+
+    RESET_PARENT_CV_CALLS();
+    b3p_reduce_stack(ctx, cvs, n_cvs, subtree_chunks, ctx->num_chunks, &out_root, 1, NULL);
+    if (memcmp(out_root.bytes, expected.bytes, 32) != 0) {
+        printf("MISMATCH in Reduce_LazyMergeWithSubtreeChunksAndRemainder\n");
+        printf("Expected: ");
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", expected.bytes[j]);
+        }
+        printf("\nGot:      ");
+        for (int j = 0; j < 32; j++) {
+            printf("%02x", out_root.bytes[j]);
+        }
+        printf("\n");
+        fflush(stdout);
+        assert(0);
+    }
+    assert(g_parent_cv_calls == (int)(n_cvs - 1));
+    printf("  Reduce_LazyMergeWithSubtreeChunksAndRemainder passed\n");
+
+    ctx->num_chunks = saved_num_chunks;
+    for (int i = 0; i < 10; i++) {
+        cvs[i] = orig_cvs[i];
+    }
+
+    RESET_PARENT_CV_CALLS();
+
+    const size_t n_cvs2 = 10;
+
+    b3_cv_bytes_t cvs_for_split[10];
+    b3_cv_bytes_t cvs_for_full[10];
+    for (size_t i = 0; i < n_cvs2; i++) {
+        cvs_for_split[i] = orig_cvs[i];
+        cvs_for_full[i] = orig_cvs[i];
+    }
+
+    b3_cv_bytes_t full_root = (b3_cv_bytes_t){0};
+    b3p_reduce_stack(ctx, cvs_for_full, n_cvs2, 1, n_cvs2, &full_root, 1, NULL);
+
+    RESET_PARENT_CV_CALLS();
+
+    split_children[0] = (b3_cv_bytes_t){0};
+    split_children[1] = (b3_cv_bytes_t){0};
+    b3p_reduce_stack(ctx, cvs_for_split, n_cvs2, 1, n_cvs2, &out_root, 1, split_children);
+
+    printf("parent_cv_calls=%d expected=%zu\n", g_parent_cv_calls, n_cvs2 - 2);
+    printf("split0_first=%02x split1_first=%02x\n", split_children[0].bytes[0], split_children[1].bytes[0]);
+
+    assert(g_parent_cv_calls == (int)(n_cvs2 - 2));
+
+    b3_cv_bytes_t root_from_children = (b3_cv_bytes_t){0};
+    xor_merge(&split_children[0], &split_children[1], &root_from_children);
+    assert(memcmp(root_from_children.bytes, full_root.bytes, 32) == 0);
+    printf("  Reduce_SplitChildrenCapturedAtRoot passed\n");
+
+    for (int i = 0; i < 10; i++) {
+        cvs[i] = orig_cvs[i];
+    }
+
+    RESET_PARENT_CV_CALLS();
+    b3p_reduce_stack(ctx, cvs, 2, 1, 2, &out_root, 1, NULL);
+    assert(g_parent_cv_calls == 1);
+    assert((g_parent_cv_flags[0] & ROOT) == ROOT);
+
+    RESET_PARENT_CV_CALLS();
+    b3p_reduce_stack(ctx, cvs, 2, 1, 2, &out_root, 0, NULL);
+    assert(g_parent_cv_calls == 1);
+    assert((g_parent_cv_flags[0] & ROOT) == 0);
+    printf("  Merge_RootFlagAppliedOnlyAtFinal passed\n");
+
+    free(ctx);
+    printf("OK\n");
+}
+
 int main(void) {
     test_alloc_failure();
     test_pool_creation_failure();
@@ -686,5 +950,7 @@ int main(void) {
     test_public_api_context();
     test_chunk_hashing_job();
     test_subtree_hashing_job();
+    test_reduction_functions();
+    test_range_hashing_core();
     return 0;
 }

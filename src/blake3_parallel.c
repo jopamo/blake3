@@ -196,7 +196,7 @@ static b3p_method_t b3p_pick_heuristic(struct b3p_ctx* ctx);
 
 static int b3p_run_method_a_chunks(struct b3p_ctx* ctx, b3_cv_bytes_t* out_root, b3_cv_bytes_t* out_split_children);
 static int b3p_run_method_b_subtrees(struct b3p_ctx* ctx, b3_cv_bytes_t* out_root, b3_cv_bytes_t* out_split_children);
-static void b3p_reduce_stack(struct b3p_ctx* ctx, b3_cv_bytes_t* cvs, size_t n, size_t subtree_chunks, b3_cv_bytes_t* out_root, int is_final, b3_cv_bytes_t* out_split_children);
+static void b3p_reduce_stack(struct b3p_ctx* ctx, b3_cv_bytes_t* cvs, size_t n, size_t subtree_chunks, size_t total_chunks, b3_cv_bytes_t* out_root, int is_final, b3_cv_bytes_t* out_split_children);
 
 static int b3p_compute_root(struct b3p_ctx* ctx, b3p_method_t method, b3_cv_bytes_t* out_root, b3_cv_bytes_t* out_split_children, uint64_t* out_ns);
 
@@ -1016,7 +1016,7 @@ b3p_hash_range_to_root(struct b3p_ctx* ctx, size_t chunk_start, size_t chunk_end
     }
 
     // Reduce the per-chunk CVs to a single root CV using stack merge to preserve tree shape
-    b3p_reduce_stack(ctx, tmp, n, 1, out_root, is_root, out_split_children);
+    b3p_reduce_stack(ctx, tmp, n, 1, n, out_root, is_root, out_split_children);
 }
 
 static void b3p_task_hash_subtrees(void* arg) {
@@ -1098,7 +1098,14 @@ static inline void b3p_merge_nodes(const uint32_t key[8], uint8_t base_flags, co
     b3_hash_parent_cv_impl(key, flags, left->bytes, right->bytes, out->bytes);
 }
 
-static void b3p_reduce_stack(struct b3p_ctx* ctx, b3_cv_bytes_t* restrict cvs, size_t n, size_t subtree_chunks, b3_cv_bytes_t* restrict out_root, int is_final, b3_cv_bytes_t* out_split_children) {
+static void b3p_reduce_stack(struct b3p_ctx* ctx,
+                             b3_cv_bytes_t* restrict cvs,
+                             size_t n,
+                             size_t subtree_chunks,
+                             size_t total_chunks,
+                             b3_cv_bytes_t* restrict out_root,
+                             int is_final,
+                             b3_cv_bytes_t* out_split_children) {
     // Validate required pointers and basic preconditions
     if (!ctx || !cvs || !out_root) {
         return;
@@ -1127,7 +1134,7 @@ static void b3p_reduce_stack(struct b3p_ctx* ctx, b3_cv_bytes_t* restrict cvs, s
 
         // If reducing subtree roots, the last subtree may be partial
         if (subtree_chunks > 1 && i == n - 1) {
-            size_t remainder = ctx->num_chunks % subtree_chunks;
+            size_t remainder = total_chunks % subtree_chunks;
             if (remainder != 0) {
                 count = remainder;
             }
@@ -1145,7 +1152,7 @@ static void b3p_reduce_stack(struct b3p_ctx* ctx, b3_cv_bytes_t* restrict cvs, s
         // Determine the count represented by this CV
         size_t count = subtree_chunks;
         if (subtree_chunks > 1 && i == n - 1) {
-            size_t remainder = ctx->num_chunks % subtree_chunks;
+            size_t remainder = total_chunks % subtree_chunks;
             if (remainder != 0) {
                 count = remainder;
             }
@@ -1320,7 +1327,7 @@ static int b3p_run_method_a_chunks(struct b3p_ctx* ctx, b3_cv_bytes_t* out_root,
     b3p_taskgroup_destroy(&g);
 
     // Reduce batch-root CVs into the final tree root
-    b3p_reduce_stack(ctx, ctx->scratch_cvs, num_batches, batch_step, out_root, 1, out_split_children);
+    b3p_reduce_stack(ctx, ctx->scratch_cvs, num_batches, batch_step, ctx->num_chunks, out_root, 1, out_split_children);
     return 0;
 }
 
@@ -1408,7 +1415,7 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx* ctx, b3_cv_bytes_t* out_roo
     b3p_taskgroup_destroy(&g);
 
     // Reduce subtree roots into the final tree root
-    b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1, out_split_children);
+    b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, ctx->num_chunks, out_root, 1, out_split_children);
     return 0;
 }
 
@@ -1489,7 +1496,7 @@ static int b3p_run_serial(struct b3p_ctx* ctx, b3_cv_bytes_t* out_root, b3_cv_by
     }
 
     // Reduce subtree roots into the final tree root
-    b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, out_root, 1, out_split_children);
+    b3p_reduce_stack(ctx, ctx->scratch_cvs, num_subtrees, subtree_chunks, ctx->num_chunks, out_root, 1, out_split_children);
     return 0;
 }
 

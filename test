@@ -48,7 +48,7 @@ C_IMPL="./build-meson-release/b3sum"          # C version
 R_IMPL="/usr/bin/b3sum_rust"    # Rust version
 
 ITERS=5                         # runs per target per impl
-SIZES_MIB=(4 8 16 128 512 1024 )  # large-file corpus sizes in MiB
+SIZES_MIB=(4 8 16 24 32 64 96 128 256 512 1024 4096)  # large-file corpus sizes in MiB
 
 SMALLFILES_COUNT=5000           # number of tiny files
 SMALLFILE_MIN=1024              # min size bytes
