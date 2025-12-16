@@ -2,40 +2,53 @@
 # bench-b3sum-llm.sh — compare C vs Rust b3sum
 #
 # FEATURES:
-#  - Valid Measurements: Uses '-N' (direct exec) for large files to avoid shell noise.
-#  - LLM-Friendly: Prints a clean Markdown summary table to STDOUT.
-#  - Detailed Logging: Saves all generation/diff/strace noise to 'bench_detail.log'.
-#  - Strict Correctness: Retains full Python normalization and diff checks.
+#  - Valid Measurements: Uses '-N' (direct exec) for large files to avoid shell noise
+#  - LLM-Friendly: Prints a clean Markdown summary table to STDOUT
+#  - Detailed Logging: Saves all generation/diff/strace noise to 'bench_detail.log'
+#  - Strict Correctness: Retains full Python normalization and diff checks
+#  - Report Artifact: Writes the user-visible Markdown output to BENCHMARK.md
+#  - Metadata: Records git commit hash/date, CPU info, kernel, timestamp
+#  - Stats: Auto-generates a Key Results section with correct slower/faster handling
 
 set -u
 set -o pipefail
 
 ####################################
-# Logging Setup
+# Logging + Report Setup
 ####################################
 
 LOGFILE="bench_detail.log"
+REPORT_MD="BENCHMARK.md"
+
 rm -f "$LOGFILE"
+: > "$REPORT_MD"
 
-# 1. Save the original STDOUT to File Descriptor 3
-exec 3>&1
+# Save original STDOUT to File Descriptor 4 (terminal)
+exec 4>&1
 
-# 2. Redirect standard STDOUT/STDERR to the log file
+# FD3 becomes "user-visible output", tee'd into BENCHMARK.md and terminal
+exec 3> >(tee -a "$REPORT_MD" >&4)
+
+# Redirect standard STDOUT/STDERR (normal script output) to the log file
 exec 1>>"$LOGFILE"
 exec 2>&1
 
-# Function: Output to user (FD3) AND log file
 say() {
   echo "$@" >&3
   echo "$@"
 }
 
-# Function: Output to log file only (for noise)
 log() {
   echo "$@"
 }
 
-say "📝 Detailed execution log saved to: $LOGFILE"
+term() {
+  echo "$@" >&4
+  echo "$@"
+}
+
+term "📝 Detailed execution log saved to: $LOGFILE"
+term "🧾 Report will be written to: $REPORT_MD"
 
 ####################################
 # Config
@@ -52,7 +65,6 @@ SMALLFILES_COUNT=5000
 SMALLFILE_MIN=1024
 SMALLFILE_MAX=4096
 
-# Hyperfine options
 HYPERFINE_OPTS=(
   "--runs" "$RUNS"
   "--warmup" "$WARMUP"
@@ -60,7 +72,6 @@ HYPERFINE_OPTS=(
   "--sort" "command"
 )
 
-# Check for shuffle support
 if hyperfine --help 2>/dev/null | grep -qE '(^|[[:space:]])--shuffle([[:space:]]|,|$)'; then
   HYPERFINE_OPTS+=("--shuffle")
 fi
@@ -76,9 +87,12 @@ require_bin() {
   fi
 }
 
+have_bin() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 require_bin hyperfine
 require_bin python3
-require_bin stat
 require_bin awk
 require_bin dd
 require_bin find
@@ -91,42 +105,6 @@ if [[ $(id -u) -eq 0 ]] && [[ -w /proc/sys/vm/drop_caches ]]; then
 fi
 
 ####################################
-# Python Helper: Parse JSON -> Markdown
-####################################
-
-print_markdown_row() {
-  local json_file="$1"
-  local label="$2"
-
-  # We use python3 to parse the JSON and print a formatted row to FD3
-  python3 -c "
-import json, sys
-
-try:
-    with open('$json_file') as f:
-        data = json.load(f)
-
-    results = {r['command']: r for r in data['results']}
-
-    # Match commands containing 'C' and 'Rust' (case insensitive logic if needed)
-    c_res = next((v for k,v in results.items() if 'C' in k), None)
-    r_res = next((v for k,v in results.items() if 'Rust' in k), None)
-
-    if c_res and r_res:
-        c_mean = c_res['mean'] * 1000
-        r_mean = r_res['mean'] * 1000
-        ratio = c_mean / r_mean
-
-        # Output: | Label | C (ms) | Rust (ms) | Ratio |
-        print(f'| {sys.argv[1]} | {c_mean:7.3f} | {r_mean:7.3f} | {ratio:5.3f} |')
-    else:
-        print(f'| {sys.argv[1]} | error | error | error |')
-except Exception as e:
-    print(f'| {sys.argv[1]} | error | error | {e} |')
-" "$label" >&3
-}
-
-####################################
 # Markdown Helper: Methodology / Run Details
 ####################################
 
@@ -137,6 +115,13 @@ emit_markdown_methodology() {
   local sizes_joined
   local nthreads
   local hf_ver
+  local bench_now
+  local kernel_summary
+  local git_root="unknown"
+  local git_head="unknown"
+  local git_date="unknown"
+  local git_dirty="unknown"
+  local cpu_summary="unknown"
 
   if printf '%s\n' "${HYPERFINE_OPTS[@]}" | grep -qx -- "--shuffle"; then
     shuffle_enabled="yes"
@@ -151,8 +136,66 @@ emit_markdown_methodology() {
 
   nthreads="$(nproc 2>/dev/null || echo unknown)"
   hf_ver="$(hyperfine --version 2>/dev/null | head -n1 || echo hyperfine)"
+  bench_now="$(date -Is 2>/dev/null || date)"
+  kernel_summary="$(uname -srmo 2>/dev/null || uname -a)"
+
+  if have_bin git && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || echo unknown)"
+    git_head="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    git_date="$(git show -s --format=%cI HEAD 2>/dev/null || echo unknown)"
+    if git diff --quiet --ignore-submodules -- 2>/dev/null && git diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
+      git_dirty="clean"
+    else
+      git_dirty="dirty"
+    fi
+  fi
+
+  if have_bin lscpu; then
+    cpu_summary="$(
+      lscpu 2>/dev/null | awk -F: '
+        function trim(s){gsub(/^[ \t]+|[ \t]+$/, "", s); return s}
+        $1 ~ /^Model name$/ { model=trim($2) }
+        $1 ~ /^CPU\(s\)$/ { cpus=trim($2) }
+        $1 ~ /^Thread\(s\) per core$/ { tpc=trim($2) }
+        $1 ~ /^Core\(s\) per socket$/ { cps=trim($2) }
+        $1 ~ /^Socket\(s\)$/ { sockets=trim($2) }
+        END {
+          if (model == "") model="unknown"
+          if (cpus == "") cpus="unknown"
+          if (tpc == "") tpc="unknown"
+          if (cps == "") cps="unknown"
+          if (sockets == "") sockets="unknown"
+          printf "%s | CPUs: %s | Sockets: %s | Cores/socket: %s | Threads/core: %s", model, cpus, sockets, cps, tpc
+        }'
+    )"
+  else
+    cpu_summary="$(
+      awk -F: '
+        function trim(s){gsub(/^[ \t]+|[ \t]+$/, "", s); return s}
+        $1 ~ /^model name$/ { model=trim($2); if (seen==0) seen=1 }
+        END { if (model=="") model="unknown"; printf "%s", model }
+      ' /proc/cpuinfo 2>/dev/null
+    )"
+  fi
+
+  echo "# Benchmark Report" >&3
+  echo "" >&3
+  echo "Generated by \`bench-b3sum-llm.sh\`" >&3
+  echo "" >&3
 
   echo "## 🧾 Benchmark Methodology" >&3
+  echo "" >&3
+  echo "**Bench run timestamp:** \`${bench_now}\`" >&3
+  echo "" >&3
+  echo "**Kernel:** \`${kernel_summary}\`" >&3
+  echo "" >&3
+  echo "**CPU:** ${cpu_summary}" >&3
+  echo "" >&3
+  echo "**Git:**" >&3
+  echo "- Root: \`${git_root}\`" >&3
+  echo "- HEAD: \`${git_head}\`" >&3
+  echo "- Commit date: \`${git_date}\`" >&3
+  echo "- Working tree: **${git_dirty}**" >&3
   echo "" >&3
   echo "**Tools:** ${hf_ver}" >&3
   echo "" >&3
@@ -171,7 +214,7 @@ emit_markdown_methodology() {
   echo "- Behavior: ${cache_behavior}" >&3
   echo "" >&3
   echo "**Workloads:**" >&3
-  echo "- **Large-file hashing:** ${big_count} files sized **${sizes_joined}** (each benchmark runs both C and Rust on the same file)" >&3
+  echo "- **Large-file hashing:** ${big_count} files sized **$(printf '%s MiB, ' "${SIZES_MIB[@]}" | sed 's/, $//')** (each benchmark runs both C and Rust on the same file)" >&3
   echo "- **Tiny-file hashing:** **${SMALLFILES_COUNT}** files with per-file size roughly **${SMALLFILE_MIN}..${SMALLFILE_MAX}** bytes" >&3
   echo "" >&3
   echo "**Data generation:**" >&3
@@ -183,6 +226,112 @@ emit_markdown_methodology() {
   echo "- For every large file: compare the hash output from C and Rust (must match)" >&3
   echo "- For tiny files: produce full per-file outputs, normalize paths, sort, and \`diff\` (must match)" >&3
   echo "" >&3
+}
+
+emit_key_results() {
+  local csv_path="$1"
+  local runs="$2"
+  local warmup="$3"
+  local npoints="$4"
+
+python3 - "$csv_path" "$runs" "$warmup" "$npoints" <<'PY' >&3
+import csv, sys
+
+path = sys.argv[1]
+runs = int(sys.argv[2])
+warmup = int(sys.argv[3])
+npoints = int(sys.argv[4])
+
+def f(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def pct(x):
+    return f"{x*100:.1f}%"
+
+rows = []
+with open(path, newline="") as fobj:
+    for r in csv.DictReader(fobj):
+        rows.append(r)
+
+large = []
+tiny_ratio = None
+
+for r in rows:
+    w = (r.get("Workload", "") or "").strip()
+    ratio = f(r.get("Ratio (C/R)", ""))
+    if ratio is None:
+        continue
+    if w.startswith("TinyFiles"):
+        tiny_ratio = ratio
+        continue
+    if "MiB" in w:
+        try:
+            mib = float(w.split()[0])
+        except Exception:
+            continue
+        large.append((mib, ratio))
+
+large.sort(key=lambda t: t[0])
+
+def select(lo, hi):
+    xs = [rt for mib, rt in large if lo <= mib <= hi]
+    if not xs:
+        return None
+    return min(xs), max(xs), sum(xs) / len(xs)
+
+def fmt_speedup_band(min_ratio, max_ratio, avg_ratio):
+    # ratio = C/R, speedup = R/C = 1/ratio
+    sp_min = 1.0 / max_ratio
+    sp_max = 1.0 / min_ratio
+    return f"~{sp_min:.2f}×–{sp_max:.2f}× faster (avg ratio {avg_ratio:.3f})"
+
+def fmt_percent_statement(min_ratio, max_ratio, avg_ratio):
+    # ratio = C/R
+    # if crosses 1.0, report slower..faster band
+    crosses = (min_ratio < 1.0) and (max_ratio > 1.0)
+    if crosses:
+        slower = max_ratio - 1.0
+        faster = (1.0 / min_ratio) - 1.0
+        return f"ranges from ~{pct(slower)} slower to ~{pct(faster)} faster (avg ratio {avg_ratio:.3f})"
+    if max_ratio <= 1.0:
+        faster_min = (1.0 / max_ratio) - 1.0
+        faster_max = (1.0 / min_ratio) - 1.0
+        return f"~{pct(faster_min)}–{pct(faster_max)} faster (avg ratio {avg_ratio:.3f})"
+    slower_min = min_ratio - 1.0
+    slower_max = max_ratio - 1.0
+    return f"~{pct(slower_min)}–{pct(slower_max)} slower (avg ratio {avg_ratio:.3f})"
+
+def fmt_tiny(ratio):
+    # ratio = C/R
+    if ratio <= 1.0:
+        faster = (1.0 / ratio) - 1.0
+        return f"C is ~{faster*100:.1f}% faster (ratio {ratio:.3f})"
+    slower = ratio - 1.0
+    return f"C is ~{slower*100:.1f}% slower (ratio {ratio:.3f})"
+
+small = select(4, 32)
+mid = select(64, 64)
+big = select(128, 1024)
+
+print("## 📌 Key Results")
+print("")
+print(f"- Hyperfine configuration: **{runs} runs**, **{warmup} warmups**, results include **{npoints} workloads**")
+if small:
+    mn, mx, avg = small
+    print(f"- **4–32 MiB:** C is {fmt_speedup_band(mn, mx, avg)}")
+if mid:
+    mn, mx, avg = mid
+    print(f"- **64 MiB:** near parity (ratio {avg:.3f})")
+if big:
+    mn, mx, avg = big
+    print(f"- **128 MiB–1 GiB:** C {fmt_percent_statement(mn, mx, avg)}")
+if tiny_ratio is not None:
+    print(f"- **TinyFiles:** {fmt_tiny(tiny_ratio)}")
+print("")
+PY
 }
 
 ####################################
@@ -217,7 +366,7 @@ SMALLDIR="$SANDBOX/smallfiles"
 mkdir -p "$SMALLDIR"
 log "Generating tiny files in $SMALLDIR..."
 for i in $(seq 1 $SMALLFILES_COUNT); do
-    dd if=/dev/urandom of="$SMALLDIR/f_$i" bs=$((1024 + RANDOM % 3000)) count=1 2>/dev/null
+  dd if=/dev/urandom of="$SMALLDIR/f_$i" bs=$((1024 + RANDOM % 3000)) count=1 2>/dev/null
 done
 
 ####################################
@@ -226,7 +375,6 @@ done
 
 say "🧪 Verifying correctness..."
 
-# 1. Large Files
 for FILE in "${FILES[@]}"; do
   HC=$("$C_IMPL" "$FILE" | awk '{print $1}')
   HR=$("$R_IMPL" "$FILE" | awk '{print $1}')
@@ -239,18 +387,14 @@ for FILE in "${FILES[@]}"; do
   fi
 done
 
-# 2. Tiny Files (Full Normalization)
 C_RAW="$SANDBOX/c_tiny.raw"
 R_RAW="$SANDBOX/r_tiny.raw"
 C_NORM="$SANDBOX/c_tiny.norm"
 R_NORM="$SANDBOX/r_tiny.norm"
 
-# REMOVE -P$(nproc) HERE:
 find "$SMALLDIR" -type f -print0 | sort -z | xargs -0 "$C_IMPL" > "$C_RAW"
-# Rust is already serial here:
 find "$SMALLDIR" -type f -print0 | sort -z | xargs -0 "$R_IMPL" > "$R_RAW"
 
-# Python Normalizer (Embedded)
 normalize_sum_output() {
   python3 - "$1" "$2" "$3" <<'PY'
 import sys
@@ -279,7 +423,6 @@ sort -o "$R_NORM" "$R_NORM"
 
 if ! diff -u "$C_NORM" "$R_NORM" >/dev/null 2>&1; then
   say "🔥 Tiny file mismatch!"
-  # Print the diff to the user so they can see why
   diff -u "$C_NORM" "$R_NORM" | head -n 20 >&3
   exit 1
 fi
@@ -296,23 +439,23 @@ if $CAN_DROP_CACHE; then
   pre_cmd="sync; echo 3 > /proc/sys/vm/drop_caches"
 fi
 
-# Print methodology/details first
 emit_markdown_methodology
 
-# Print Markdown Header
+RESULTS_CSV="$SANDBOX/results.csv"
+echo "Workload,C (ms),Rust (ms),Ratio (C/R)" > "$RESULTS_CSV"
+
 echo "## 🚀 Benchmark Results" >&3
 echo "" >&3
 echo "| Workload | C (ms) | Rust (ms) | Ratio (C/R) |" >&3
 echo "| :--- | :--- | :--- | :--- |" >&3
 
-# 1. Large Files
-for FILE in "${FILES[@]}"; do
-  SIZE_MIB=$(stat -c %s "$FILE" | awk '{print $1/1024/1024}')
+# Large files
+for idx in "${!FILES[@]}"; do
+  FILE="${FILES[$idx]}"
+  SIZE_MIB="${SIZES_MIB[$idx]}"
   LABEL="${SIZE_MIB} MiB"
   JSON_OUT="$SANDBOX/hf_big_${SIZE_MIB}.json"
 
-  # FIX: Removed '--' separators.
-  # Hyperfine will correctly map option -n "Name" to the next positional arg.
   hyperfine "${HYPERFINE_OPTS[@]}" \
     -N \
     --prepare "$pre_cmd" \
@@ -320,21 +463,73 @@ for FILE in "${FILES[@]}"; do
     --command-name "C"    "$C_IMPL $FILE" \
     --command-name "Rust" "$R_IMPL $FILE"
 
-  print_markdown_row "$JSON_OUT" "$LABEL"
+  python3 - "$JSON_OUT" "$LABEL" "$RESULTS_CSV" <<'PY' >&3
+import json, sys
+
+json_path, label, csv_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(json_path) as f:
+    data = json.load(f)
+
+results = {r["command"]: r for r in data["results"]}
+c_res = next((v for k,v in results.items() if "C" in k), None)
+r_res = next((v for k,v in results.items() if "Rust" in k), None)
+
+if not (c_res and r_res):
+    print(f"| {label} | error | error | error |")
+    raise SystemExit(0)
+
+c_ms = c_res["mean"] * 1000.0
+r_ms = r_res["mean"] * 1000.0
+ratio = c_ms / r_ms
+
+print(f"| {label} | {c_ms:7.3f} | {r_ms:7.3f} | {ratio:5.3f} |")
+
+with open(csv_path, "a") as out:
+    out.write(f"{label},{c_ms:.3f},{r_ms:.3f},{ratio:.6f}\n")
+PY
 done
 
-# 2. Tiny Files
+# Tiny files
 LABEL="TinyFiles (${SMALLFILES_COUNT})"
 JSON_OUT="$SANDBOX/hf_tiny.json"
 
-# Rust requires shell for the find|xargs pipeline, so no -N here.
 hyperfine "${HYPERFINE_OPTS[@]}" \
   --prepare "$pre_cmd" \
   --export-json "$JSON_OUT" \
-  --command-name "C"    "find '$SMALLDIR' -type f -print0 | sort -z | xargs -P$(nproc) -0 '$C_IMPL' >/dev/null" \
-  --command-name "Rust" "find '$SMALLDIR' -type f -print0 | sort -z | xargs -0 '$R_IMPL' >/dev/null"
+  --command-name "C"    "find '$SMALLDIR' -type f -print0 | sort -z | xargs -0 -P$(nproc) -n 100 '$C_IMPL' -j1 >/dev/null" \
+  --command-name "Rust" "find '$SMALLDIR' -type f -print0 | sort -z | xargs -0 -P$(nproc) -n 100 '$R_IMPL' >/dev/null"
 
-print_markdown_row "$JSON_OUT" "$LABEL"
+python3 - "$JSON_OUT" "$LABEL" "$RESULTS_CSV" <<'PY' >&3
+import json, sys
 
-say ""
-say "✨ Done. Full verbose log in: $LOGFILE"
+json_path, label, csv_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(json_path) as f:
+    data = json.load(f)
+
+results = {r["command"]: r for r in data["results"]}
+c_res = next((v for k,v in results.items() if "C" in k), None)
+r_res = next((v for k,v in results.items() if "Rust" in k), None)
+
+if not (c_res and r_res):
+    print(f"| {label} | error | error | error |")
+    raise SystemExit(0)
+
+c_ms = c_res["mean"] * 1000.0
+r_ms = r_res["mean"] * 1000.0
+ratio = c_ms / r_ms
+
+print(f"| {label} | {c_ms:7.3f} | {r_ms:7.3f} | {ratio:5.3f} |")
+
+with open(csv_path, "a") as out:
+    out.write(f"{label},{c_ms:.3f},{r_ms:.3f},{ratio:.6f}\n")
+PY
+
+echo "" >&3
+
+emit_key_results "$RESULTS_CSV" "$RUNS" "$WARMUP" "$(( ${#SIZES_MIB[@]} + 1 ))"
+
+term ""
+term "✨ Done. Full verbose log in: $LOGFILE"
+term "🧾 Wrote report to: $REPORT_MD"

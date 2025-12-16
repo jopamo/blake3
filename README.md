@@ -1,4 +1,4 @@
-# BLAKE3 C Library (Linux/Meson)
+# BLAKE3 C Library
 
 <div align="center">
 
