@@ -54,8 +54,62 @@ term "🧾 Report will be written to: $REPORT_MD"
 # Config
 ####################################
 
-C_IMPL="./build-meson-release/b3sum"
-R_IMPL="/usr/bin/b3sum_rust"
+# Allow overrides:
+#   C_IMPL=/path/to/b3sum ./bench-b3sum.sh
+#   R_IMPL=/path/to/b3sum_rust ./bench-b3sum.sh
+C_IMPL="${C_IMPL:-}"
+R_IMPL="${R_IMPL:-/usr/bin/b3sum_rust}"
+
+# Common build outputs (first match wins)
+C_IMPL_CANDIDATES=(
+  "./build-meson-release/b3sum"
+  "./build-meson-asan/b3sum"
+  "./build/b3sum"
+)
+
+resolve_impl() {
+  local name="$1"
+  local current="$2"
+  shift 2
+  local -a candidates=("$@")
+
+  if [[ -n "$current" ]]; then
+    if [[ -x "$current" ]]; then
+      echo "$current"
+      return 0
+    fi
+    echo "🔥 Error: ${name} is set but not executable: $current" >&3
+    exit 1
+  fi
+
+  # Prefer in-tree builds when any build dir exists
+  if [[ -d "./build-meson-release" || -d "./build-meson-asan" || -d "./build" ]]; then
+    for p in "${candidates[@]}"; do
+      if [[ -x "$p" ]]; then
+        echo "$p"
+        return 0
+      fi
+    done
+    echo "🔥 Error: found a build directory but no executable ${name} in expected locations:" >&3
+    for p in "${candidates[@]}"; do
+      echo "  - $p" >&3
+    done
+    echo "Tip: rebuild, or set ${name}=/path/to/binary" >&3
+    exit 1
+  fi
+
+  # No build dir present: fall back to system b3sum
+  if [[ -x "/usr/bin/b3sum" ]]; then
+    echo "/usr/bin/b3sum"
+    return 0
+  fi
+
+  echo "🔥 Error: no build directories found and /usr/bin/b3sum is missing or not executable" >&3
+  echo "Tip: install b3sum or set ${name}=/path/to/binary" >&3
+  exit 1
+}
+
+C_IMPL="$(resolve_impl C_IMPL "$C_IMPL" "${C_IMPL_CANDIDATES[@]}")"
 
 RUNS=10
 WARMUP=2
