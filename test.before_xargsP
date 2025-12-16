@@ -186,9 +186,7 @@ R_RAW="$SANDBOX/r_tiny.raw"
 C_NORM="$SANDBOX/c_tiny.norm"
 R_NORM="$SANDBOX/r_tiny.norm"
 
-# REMOVE -P$(nproc) HERE:
 find "$SMALLDIR" -type f -print0 | sort -z | xargs -0 "$C_IMPL" > "$C_RAW"
-# Rust is already serial here:
 find "$SMALLDIR" -type f -print0 | sort -z | xargs -0 "$R_IMPL" > "$R_RAW"
 
 # Python Normalizer (Embedded)
@@ -269,7 +267,7 @@ JSON_OUT="$SANDBOX/hf_tiny.json"
 hyperfine "${HYPERFINE_OPTS[@]}" \
   --prepare "$pre_cmd" \
   --export-json "$JSON_OUT" \
-  --command-name "C"    "find '$SMALLDIR' -type f -print0 | sort -z | xargs -P$(nproc) -0 '$C_IMPL' >/dev/null" \
+  --command-name "C"    "find '$SMALLDIR' -type f -print0 | sort -z | xargs -0 '$C_IMPL' >/dev/null" \
   --command-name "Rust" "find '$SMALLDIR' -type f -print0 | sort -z | xargs -0 '$R_IMPL' >/dev/null"
 
 print_markdown_row "$JSON_OUT" "$LABEL"
