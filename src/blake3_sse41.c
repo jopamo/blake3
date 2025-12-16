@@ -7,11 +7,11 @@
 #define _mm_shuffle_ps2(a, b, c) (_mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), (c))))
 
 INLINE __m128i loadu(const uint8_t src[16]) {
-    return _mm_loadu_si128((const __m128i*)src);
+    return _mm_loadu_si128((const __m128i_u*)src);
 }
 
 INLINE void storeu(__m128i src, uint8_t dest[16]) {
-    _mm_storeu_si128((__m128i*)dest, src);
+    _mm_storeu_si128((__m128i_u*)dest, src);
 }
 
 INLINE __m128i addv(__m128i a, __m128i b) {
@@ -32,7 +32,8 @@ INLINE __m128i set4(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
 }
 
 INLINE __m128i rot16(__m128i x) {
-    return _mm_shuffle_epi8(x, _mm_set_epi8(13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2));
+    static const __m128i mask = (const __m128i)_mm_set_epi8(13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2);
+    return _mm_shuffle_epi8(x, mask);
 }
 
 INLINE __m128i rot12(__m128i x) {
@@ -40,7 +41,8 @@ INLINE __m128i rot12(__m128i x) {
 }
 
 INLINE __m128i rot8(__m128i x) {
-    return _mm_shuffle_epi8(x, _mm_set_epi8(12, 15, 14, 13, 8, 11, 10, 9, 4, 7, 6, 5, 0, 3, 2, 1));
+    static const __m128i mask = (const __m128i)_mm_set_epi8(12, 15, 14, 13, 8, 11, 10, 9, 4, 7, 6, 5, 0, 3, 2, 1);
+    return _mm_shuffle_epi8(x, mask);
 }
 
 INLINE __m128i rot7(__m128i x) {

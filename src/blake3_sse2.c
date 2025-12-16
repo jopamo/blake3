@@ -7,11 +7,11 @@
 #define _mm_shuffle_ps2(a, b, c) (_mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), (c))))
 
 INLINE __m128i loadu(const uint8_t src[16]) {
-    return _mm_loadu_si128((const __m128i*)src);
+    return _mm_loadu_si128((const __m128i_u*)src);
 }
 
 INLINE void storeu(__m128i src, uint8_t dest[16]) {
-    _mm_storeu_si128((__m128i*)dest, src);
+    _mm_storeu_si128((__m128i_u*)dest, src);
 }
 
 INLINE __m128i addv(__m128i a, __m128i b) {
