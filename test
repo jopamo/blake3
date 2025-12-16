@@ -127,6 +127,65 @@ except Exception as e:
 }
 
 ####################################
+# Markdown Helper: Methodology / Run Details
+####################################
+
+emit_markdown_methodology() {
+  local shuffle_enabled="no"
+  local cache_behavior="OS page cache left intact"
+  local big_count="${#SIZES_MIB[@]}"
+  local sizes_joined
+  local nthreads
+  local hf_ver
+
+  if printf '%s\n' "${HYPERFINE_OPTS[@]}" | grep -qx -- "--shuffle"; then
+    shuffle_enabled="yes"
+  fi
+
+  if $CAN_DROP_CACHE; then
+    cache_behavior="drops OS page cache via /proc/sys/vm/drop_caches (requires root)"
+  fi
+
+  sizes_joined="$(printf '%s MiB, ' "${SIZES_MIB[@]}")"
+  sizes_joined="${sizes_joined%, }"
+
+  nthreads="$(nproc 2>/dev/null || echo unknown)"
+  hf_ver="$(hyperfine --version 2>/dev/null | head -n1 || echo hyperfine)"
+
+  echo "## 🧾 Benchmark Methodology" >&3
+  echo "" >&3
+  echo "**Tools:** ${hf_ver}" >&3
+  echo "" >&3
+  echo "**Implementations:**" >&3
+  echo "- **C:** \`${C_IMPL}\`" >&3
+  echo "- **Rust:** \`${R_IMPL}\`" >&3
+  echo "" >&3
+  echo "**Hyperfine settings:**" >&3
+  echo "- Runs per command: **${RUNS}**" >&3
+  echo "- Warmup runs: **${WARMUP}**" >&3
+  echo "- Shuffle order: **${shuffle_enabled}**" >&3
+  echo "- Thread count (system): \`${nthreads}\`" >&3
+  echo "" >&3
+  echo "**Cache / prepare step:**" >&3
+  echo "- \`${pre_cmd}\`" >&3
+  echo "- Behavior: ${cache_behavior}" >&3
+  echo "" >&3
+  echo "**Workloads:**" >&3
+  echo "- **Large-file hashing:** ${big_count} files sized **${sizes_joined}** (each benchmark runs both C and Rust on the same file)" >&3
+  echo "- **Tiny-file hashing:** **${SMALLFILES_COUNT}** files with per-file size roughly **${SMALLFILE_MIN}..${SMALLFILE_MAX}** bytes" >&3
+  echo "" >&3
+  echo "**Data generation:**" >&3
+  echo "- All test data is created in a temporary sandbox under \`/tmp\` and removed on exit" >&3
+  echo "- Large files are created via \`fallocate\` when available, otherwise \`dd if=/dev/urandom\`" >&3
+  echo "- Tiny files are created with \`dd if=/dev/urandom\` (1 block per file)" >&3
+  echo "" >&3
+  echo "**Correctness checks (performed before benchmarking):**" >&3
+  echo "- For every large file: compare the hash output from C and Rust (must match)" >&3
+  echo "- For tiny files: produce full per-file outputs, normalize paths, sort, and \`diff\` (must match)" >&3
+  echo "" >&3
+}
+
+####################################
 # Data Generation
 ####################################
 
@@ -236,6 +295,9 @@ pre_cmd="sync"
 if $CAN_DROP_CACHE; then
   pre_cmd="sync; echo 3 > /proc/sys/vm/drop_caches"
 fi
+
+# Print methodology/details first
+emit_markdown_methodology
 
 # Print Markdown Header
 echo "## 🚀 Benchmark Results" >&3
