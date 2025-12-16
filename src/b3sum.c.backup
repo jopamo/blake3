@@ -22,6 +22,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,7 @@
 
 #define STREAM_BUF_MIN ((size_t)DEFAULT_BUF)
 #define STREAM_BUF_MAX ((size_t)MAX_BUF)
+
 
 /* Per-thread reusable I/O buffer
    Each worker owns a private buffer to avoid malloc/free churn and false sharing */
@@ -134,6 +136,7 @@ typedef struct {
     int warn;            // print warnings on parse errors
     int jobs;            // number of worker threads (0 = auto)
 } program_opts;
+
 
 /* Aggregated results
    Updated by workers, read by main */
@@ -293,6 +296,22 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
         munmap((void*)ctx.map, ctx.map_len);
     return rc;
 }
+
+/* cpu_relax gives the CPU a short hint in spin loops
+   Reduces contention cost in tight CAS retry loops */
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define cpu_relax() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define cpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define cpu_relax() ((void)0)
+#endif
+
+
+
+
+
 
 static void print_help(void) {
     puts(
@@ -615,132 +634,17 @@ static int hash_fd_stream_fast(int fd, off_t filesize, uint8_t* output) {
 
     return hash_fd_stream_with_buffer(fd, filesize, output, buf, buf_sz);
 }
-static int process_one_path(const program_opts* opts, const char* path, int is_check_mode, const uint8_t expected[BLAKE3_OUT_LEN]) {
-    uint8_t out[BLAKE3_OUT_LEN];
-    const char* name = path ? path : "-";
 
-    int rc = 0;
-    int saved_errno = 0;
 
-    if (strcmp(name, "-") == 0) {
-        struct stat stin;
-        if (fstat(STDIN_FILENO, &stin) != 0) {
-            rc = -1;
-            saved_errno = errno;
-        }
-        else {
-            rc = hash_fd_stream_fast(STDIN_FILENO, stin.st_size, out);
-            if (rc != 0)
-                saved_errno = errno;
-        }
-    }
-    else {
-        int oflags = O_RDONLY | O_CLOEXEC;
-#ifdef O_NOATIME
-        struct stat st0;
-        if (lstat(name, &st0) == 0 && (st0.st_uid == geteuid() || geteuid() == 0))
-            oflags |= O_NOATIME;
-#endif
-        int fd = open(name, oflags);
-        if (fd < 0) {
-            rc = -1;
-            saved_errno = errno;
-        }
-        else {
-            struct stat st;
-            if (fstat(fd, &st) != 0) {
-                rc = -1;
-                saved_errno = errno;
-            }
-            else {
-                if (S_ISREG(st.st_mode)) {
-                    rc = hash_regular_file_parallel(opts, name, fd, &st, out);
-                }
-                else {
-                    rc = hash_fd_stream_fast(fd, st.st_size, out);
-                }
-                if (rc != 0)
-                    saved_errno = errno;
-            }
-            close(fd);
-        }
-    }
 
-    pthread_mutex_lock(&output_mutex);
-    if (is_check_mode) {
-        int ok = (rc == 0 && memcmp(expected, out, BLAKE3_OUT_LEN) == 0);
-        if (ok) {
-            if (!opts->quiet && !opts->status)
-                printf("%s: OK\n", name);
-        }
-        else {
-            atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
-            if (!opts->status)
-                printf("%s: FAILED\n", name);
-        }
-    }
-    else {
-        if (rc == 0 && !opts->status) {
-            print_hash(out, name, opts->tag, opts->zero);
-        }
-        else if (rc != 0 && (!opts->ignore_missing || saved_errno != ENOENT)) {
-            fprintf(stderr, "b3sum: %s: %s\n", name, strerror(saved_errno));
-            atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
-        }
-    }
-    pthread_mutex_unlock(&output_mutex);
 
-    return rc;
-}
-static int process_check_files_serial(int fc, char** files, const program_opts* opts) {
-    char* line = NULL;
-    size_t len = 0;
 
-    if (fc == 0) {
-        while (getline(&line, &len, stdin) != -1) {
-            char* fname = NULL;
-            uint8_t expected[BLAKE3_OUT_LEN];
-            if (parse_check_line(line, opts, &fname, expected) != 0) {
-                if (opts->warn)
-                    fputs("b3sum: warning: invalid line in checksum input\n", stderr);
-                if (opts->strict)
-                    atomic_store_explicit(&any_format_error_global, 1, memory_order_relaxed);
-                continue;
-            }
-            process_one_path(opts, fname, 1, expected);
-            free(fname);
-        }
-    }
-    else {
-        for (int i = 0; i < fc; i++) {
-            FILE* f = (strcmp(files[i], "-") == 0) ? stdin : fopen(files[i], "r");
-            if (!f) {
-                fprintf(stderr, "b3sum: %s: %s\n", files[i], strerror(errno));
-                atomic_store_explicit(&any_failure_global, 1, memory_order_relaxed);
-                continue;
-            }
-            while (getline(&line, &len, f) != -1) {
-                char* fname = NULL;
-                uint8_t expected[BLAKE3_OUT_LEN];
-                if (parse_check_line(line, opts, &fname, expected) != 0) {
-                    if (opts->warn)
-                        fputs("b3sum: warning: invalid line in checksum input\n", stderr);
-                    if (opts->strict)
-                        atomic_store_explicit(&any_format_error_global, 1, memory_order_relaxed);
-                    continue;
-                }
-                process_one_path(opts, fname, 1, expected);
-                free(fname);
-            }
-            if (f != stdin)
-                fclose(f);
-        }
-    }
 
-    free(line);
 
-    return (atomic_load_explicit(&any_failure_global, memory_order_relaxed) || (atomic_load_explicit(&any_format_error_global, memory_order_relaxed) && opts->strict)) ? 1 : 0;
-}
+
+
+
+
 int main(int argc, char** argv) {
     program_opts opts;
     int argi = handle_options(argc, argv, &opts);
@@ -753,9 +657,7 @@ int main(int argc, char** argv) {
     char** files = &argv[argi];
 
     if (opts.check) {
-        int r = process_check_files_serial(fc, files, &opts);
-        release_tls_io_buffer();
-        b3p_free_tls_resources();
+        int r = process_check_files_multithread(fc, files, &opts);
         return r ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
@@ -765,12 +667,18 @@ int main(int argc, char** argv) {
         fc = 1;
     }
 
-    for (int i = 0; i < fc; i++) {
-        process_one_path(&opts, files[i], 0, NULL);
+    atomic_store_explicit(&done_submitting_tasks, 0, memory_order_release);
+
+    producer_args pa = {.opts = &opts, .filec = fc, .filev = files};
+
+    pthread_t prod;
+    if (pthread_create(&prod, NULL, producer_thread_main, &pa) != 0) {
+        perror("pthread_create");
+        exit(EXIT_FAILURE);
     }
 
-    release_tls_io_buffer();
-    b3p_free_tls_resources();
+    run_pool_and_wait(&opts);
+    pthread_join(prod, NULL);
 
     return atomic_load_explicit(&any_failure_global, memory_order_relaxed) ? EXIT_FAILURE : EXIT_SUCCESS;
 }
