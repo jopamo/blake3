@@ -21,6 +21,17 @@ blake3_compress_in_place_neon:
     mov     x19, x0
     mov     x20, x1
 
+    // Load counter into w12, w13 (from x3)
+    mov     w12, w3             // Low 32 bits of counter
+    lsr     x9, x3, #32         // Use x9 (scratch) for high bits shift
+    mov     w13, w9             // High 32 bits of counter
+
+    // Load block_len into w14 (from w2)
+    uxtb    w14, w2
+
+    // Load flags into w15 (from w4)
+    uxtb    w15, w4
+
     // Load state w0-w7 from cv (x19)
     ldp     w0, w1, [x19, #0]
     ldp     w2, w3, [x19, #8]
@@ -28,27 +39,6 @@ blake3_compress_in_place_neon:
     ldp     w6, w7, [x19, #24]
 
     // Load IV into w8-w11
-    // IV[0] = 0x6A09E667
-    mov     w8, #0xE667
-    movk    w8, #0x6A09, lsl #16
-    // IV[1] = 0xBB67AE85
-    mov     w9, #0xAE85
-    movk    w9, #0xBB67, lsl #16
-    // IV[2] = 0x3C6EF372
-    mov     w10, #0xF372
-    movk    w10, #0x3C6E, lsl #16
-    // IV[3] = 0xA54FF53A
-    mov     w11, #0xF53A
-    movk    w11, #0xA54F, lsl #16
-
-    // Load counter into w12, w13
-    mov     w12, w3             // Low 32 bits of counter
-    lsr     x9, x3, #32         // Use x9 (scratch) for high bits shift
-    mov     w13, w9             // High 32 bits of counter
-
-    // Load block_len and flags into w14, w15
-    uxtb    w14, w2
-    uxtb    w15, w4
 
     // Define G macro
     .macro G a, b, c, d, m0, m1
