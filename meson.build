@@ -228,6 +228,14 @@ test_b3p_comprehensive = executable(
 )
 test('b3p_comprehensive', test_b3p_comprehensive)
 
+test_parallel_edge_cases = executable(
+  'test_parallel_edge_cases',
+  ['tests/test_parallel_edge_cases.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('parallel_edge_cases', test_parallel_edge_cases)
+
 test('cli',
   find_program('tests/test_cli.sh'),
   depends: [b3sum_exe],

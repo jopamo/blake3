@@ -44,6 +44,42 @@ if [ "$ACTUAL_STDIN" != "$EXPECTED_STDIN" ]; then
     exit 1
 fi
 
+# 5. Large file / Parallelism consistency check
+# The benchmark failure involved a 4MB file with mixed zero/data regions.
+# We create a similar file and verify that multi-threaded hashing matches single-threaded.
+
+# 4MB file: 2MB zero, 1MB random, 1MB zero
+# Note: we construct it carefully to ensure specific regions
+dd if=/dev/zero of=test_4mb.bin bs=1M count=4 status=none
+# Overwrite 3rd MB with random
+dd if=/dev/urandom of=test_4mb.bin bs=1M count=1 seek=2 conv=notrunc status=none
+
+HASH_MT=$($B3SUM test_4mb.bin | cut -d' ' -f1)
+HASH_ST=$($B3SUM --jobs 1 test_4mb.bin | cut -d' ' -f1)
+
+if [ "$HASH_MT" != "$HASH_ST" ]; then
+    echo "Parallel consistency failed on 4MB mixed file"
+    echo "Multi-threaded: $HASH_MT"
+    echo "Single-threaded: $HASH_ST"
+    exit 1
+fi
+rm test_4mb.bin
+
+# 6. Sparse file check
+# Create a sparse file using seek (if supported by FS)
+# 4MB hole, then 4KB data
+dd if=/dev/urandom of=test_sparse.bin bs=4k count=1 seek=1024 status=none 
+HASH_SPARSE_MT=$($B3SUM test_sparse.bin | cut -d' ' -f1)
+HASH_SPARSE_ST=$($B3SUM --jobs 1 test_sparse.bin | cut -d' ' -f1)
+
+if [ "$HASH_SPARSE_MT" != "$HASH_SPARSE_ST" ]; then
+    echo "Parallel consistency failed on sparse file"
+    echo "Multi-threaded: $HASH_SPARSE_MT"
+    echo "Single-threaded: $HASH_SPARSE_ST"
+    exit 1
+fi
+rm test_sparse.bin
+
 echo "CLI tests passed"
 rm test_input.txt test_checksums.txt test_bad.txt
 exit 0
