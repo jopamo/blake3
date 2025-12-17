@@ -45,6 +45,10 @@ if host_machine.cpu_family() == 'x86_64'
 elif host_machine.cpu_family() in ['arm', 'aarch64']
   blake3_sources += ['src/blake3_neon.c']
 
+  if host_machine.cpu_family() == 'aarch64'
+    blake3_sources += ['src/blake3_aarch64_unix.S']
+  endif
+
   # on aarch64 NEON is baseline, no flag needed
   if host_machine.cpu_family() == 'arm'
     if cc.has_argument('-mfpu=neon')

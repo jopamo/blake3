@@ -68,6 +68,59 @@ INLINE uint32x4_t rot7_128(uint32x4_t x) {
     return vsriq_n_u32(vshlq_n_u32(x, 32 - 7), x, 7);
 }
 
+INLINE uint32x4_t rot_l_1(uint32x4_t x) {
+    return vreinterpretq_u32_u8(vextq_u8(vreinterpretq_u8_u32(x), vreinterpretq_u8_u32(x), 4));
+}
+INLINE uint32x4_t rot_l_2(uint32x4_t x) {
+    return vreinterpretq_u32_u8(vextq_u8(vreinterpretq_u8_u32(x), vreinterpretq_u8_u32(x), 8));
+}
+INLINE uint32x4_t rot_l_3(uint32x4_t x) {
+    return vreinterpretq_u32_u8(vextq_u8(vreinterpretq_u8_u32(x), vreinterpretq_u8_u32(x), 12));
+}
+INLINE uint32x4_t rot_r_1(uint32x4_t x) {
+    return rot_l_3(x);
+}
+INLINE uint32x4_t rot_r_2(uint32x4_t x) {
+    return rot_l_2(x);
+}
+INLINE uint32x4_t rot_r_3(uint32x4_t x) {
+    return rot_l_1(x);
+}
+
+INLINE void g1_neon(uint32x4_t* row0, uint32x4_t* row1, uint32x4_t* row2, uint32x4_t* row3, uint32x4_t m) {
+    *row0 = add_128(add_128(*row0, m), *row1);
+    *row3 = xor_128(*row3, *row0);
+    *row3 = rot16_128(*row3);
+    *row2 = add_128(*row2, *row3);
+    *row1 = xor_128(*row1, *row2);
+    *row1 = rot12_128(*row1);
+}
+
+INLINE void g2_neon(uint32x4_t* row0, uint32x4_t* row1, uint32x4_t* row2, uint32x4_t* row3, uint32x4_t m) {
+    *row0 = add_128(add_128(*row0, m), *row1);
+    *row3 = xor_128(*row3, *row0);
+    *row3 = rot8_128(*row3);
+    *row2 = add_128(*row2, *row3);
+    *row1 = xor_128(*row1, *row2);
+    *row1 = rot7_128(*row1);
+}
+
+INLINE void diagonalize_neon(uint32x4_t* row0, uint32x4_t* row2, uint32x4_t* row3) {
+    *row0 = rot_r_1(*row0);
+    *row3 = rot_r_2(*row3);
+    *row2 = rot_r_3(*row2);
+}
+
+INLINE void undiagonalize_neon(uint32x4_t* row0, uint32x4_t* row2, uint32x4_t* row3) {
+    *row0 = rot_l_1(*row0);
+    *row3 = rot_l_2(*row3);
+    *row2 = rot_l_3(*row2);
+}
+
+#if defined(__aarch64__)
+void blake3_compress_in_place_neon(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags);
+#endif
+
 // TODO: compress_neon
 
 // TODO: hash2_neon
@@ -306,10 +359,14 @@ INLINE void hash_one_neon(const uint8_t* input, size_t blocks, const uint32_t ke
         if (blocks == 1) {
             block_flags |= flags_end;
         }
+#if defined(__aarch64__)
+        blake3_compress_in_place_neon(cv, input, BLAKE3_BLOCK_LEN, counter, block_flags);
+#else
         // TODO: Implement compress_neon. However note that according to
         // https://github.com/BLAKE2/BLAKE2/commit/7965d3e6e1b4193438b8d3a656787587d2579227,
         // compress_neon might not be any faster than compress_portable.
         blake3_compress_in_place_portable(cv, input, BLAKE3_BLOCK_LEN, counter, block_flags);
+#endif
         input = &input[BLAKE3_BLOCK_LEN];
         blocks -= 1;
         block_flags = flags;

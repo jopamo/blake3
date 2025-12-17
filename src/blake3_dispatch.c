@@ -220,6 +220,12 @@ void blake3_compress_in_place(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_L
     }
 #endif
 #endif
+
+#if defined(__aarch64__)
+    blake3_compress_in_place_neon(cv, block, block_len, counter, flags);
+    return;
+#endif
+
     blake3_compress_in_place_portable(cv, block, block_len, counter, flags);
 }
 
@@ -323,6 +329,10 @@ void blake3_hash_many(const uint8_t* const* inputs,
 
     blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
 }
+
+#if defined(__aarch64__)
+void blake3_compress_in_place_neon(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags);
+#endif
 
 size_t blake3_simd_degree(void) {
 #if defined(IS_X86)
