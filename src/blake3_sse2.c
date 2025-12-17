@@ -259,8 +259,8 @@ INLINE void compress_pre(__m128i rows[4], const uint32_t cv[8], const uint8_t bl
 void blake3_compress_in_place_sse2(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags) {
     __m128i rows[4];
     compress_pre(rows, cv, block, block_len, counter, flags);
-    storeu(xorv(rows[0], rows[2]), (uint8_t*)&cv[0]);
-    storeu(xorv(rows[1], rows[3]), (uint8_t*)&cv[4]);
+    storeu(xorv(xorv(rows[0], rows[2]), loadu((uint8_t*)&cv[0])), (uint8_t*)&cv[0]);
+    storeu(xorv(xorv(rows[1], rows[3]), loadu((uint8_t*)&cv[4])), (uint8_t*)&cv[4]);
 }
 
 void blake3_compress_xof_sse2(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags, uint8_t out[64]) {
@@ -475,14 +475,14 @@ blake3_hash4_sse2(const uint8_t* const* inputs, size_t blocks, const uint32_t ke
         round_fn(v, msg_vecs, 4);
         round_fn(v, msg_vecs, 5);
         round_fn(v, msg_vecs, 6);
-        h_vecs[0] = xorv(v[0], v[8]);
-        h_vecs[1] = xorv(v[1], v[9]);
-        h_vecs[2] = xorv(v[2], v[10]);
-        h_vecs[3] = xorv(v[3], v[11]);
-        h_vecs[4] = xorv(v[4], v[12]);
-        h_vecs[5] = xorv(v[5], v[13]);
-        h_vecs[6] = xorv(v[6], v[14]);
-        h_vecs[7] = xorv(v[7], v[15]);
+        h_vecs[0] = xorv(h_vecs[0], xorv(v[0], v[8]));
+        h_vecs[1] = xorv(h_vecs[1], xorv(v[1], v[9]));
+        h_vecs[2] = xorv(h_vecs[2], xorv(v[2], v[10]));
+        h_vecs[3] = xorv(h_vecs[3], xorv(v[3], v[11]));
+        h_vecs[4] = xorv(h_vecs[4], xorv(v[4], v[12]));
+        h_vecs[5] = xorv(h_vecs[5], xorv(v[5], v[13]));
+        h_vecs[6] = xorv(h_vecs[6], xorv(v[6], v[14]));
+        h_vecs[7] = xorv(h_vecs[7], xorv(v[7], v[15]));
 
         block_flags = flags;
     }
