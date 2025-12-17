@@ -50,47 +50,6 @@
 
 #define MAYBE_UNUSED(x) (void)((x))
 
-#if defined(IS_X86)
-static uint64_t xgetbv(void) {
-#if defined(_MSC_VER)
-    return _xgetbv(0);
-#else
-    uint32_t eax = 0, edx = 0;
-    __asm__ __volatile__("xgetbv\n" : "=a"(eax), "=d"(edx) : "c"(0));
-    return ((uint64_t)edx << 32) | eax;
-#endif
-}
-
-static void cpuid(uint32_t out[4], uint32_t id) {
-#if defined(_MSC_VER)
-    __cpuid((int*)out, id);
-#elif defined(__i386__) || defined(_M_IX86)
-    __asm__ __volatile__(
-        "movl %%ebx, %1\n"
-        "cpuid\n"
-        "xchgl %1, %%ebx\n"
-        : "=a"(out[0]), "=r"(out[1]), "=c"(out[2]), "=d"(out[3])
-        : "a"(id));
-#else
-    __asm__ __volatile__("cpuid\n" : "=a"(out[0]), "=b"(out[1]), "=c"(out[2]), "=d"(out[3]) : "a"(id));
-#endif
-}
-
-static void cpuidex(uint32_t out[4], uint32_t id, uint32_t sid) {
-#if defined(_MSC_VER)
-    __cpuidex((int*)out, id, sid);
-#elif defined(__i386__) || defined(_M_IX86)
-    __asm__ __volatile__(
-        "movl %%ebx, %1\n"
-        "cpuid\n"
-        "xchgl %1, %%ebx\n"
-        : "=a"(out[0]), "=r"(out[1]), "=c"(out[2]), "=d"(out[3])
-        : "a"(id), "c"(sid));
-#else
-    __asm__ __volatile__("cpuid\n" : "=a"(out[0]), "=b"(out[1]), "=c"(out[2]), "=d"(out[3]) : "a"(id), "c"(sid));
-#endif
-}
-
 enum cpu_feature { SSE2 = 1 << 0, SSSE3 = 1 << 1, SSE41 = 1 << 2, AVX = 1 << 3, AVX2 = 1 << 4, AVX512F = 1 << 5, AVX512VL = 1 << 6, NEON = 1 << 7, UNDEFINED = 1 << 30 };
 
 #if !defined(BLAKE3_TESTING)
@@ -173,6 +132,47 @@ static
         return 0;
 #endif
     }
+}
+
+#if defined(IS_X86)
+static uint64_t xgetbv(void) {
+#if defined(_MSC_VER)
+    return _xgetbv(0);
+#else
+    uint32_t eax = 0, edx = 0;
+    __asm__ __volatile__("xgetbv\n" : "=a"(eax), "=d"(edx) : "c"(0));
+    return ((uint64_t)edx << 32) | eax;
+#endif
+}
+
+static void cpuid(uint32_t out[4], uint32_t id) {
+#if defined(_MSC_VER)
+    __cpuid((int*)out, id);
+#elif defined(__i386__) || defined(_M_IX86)
+    __asm__ __volatile__(
+        "movl %%ebx, %1\n"
+        "cpuid\n"
+        "xchgl %1, %%ebx\n"
+        : "=a"(out[0]), "=r"(out[1]), "=c"(out[2]), "=d"(out[3])
+        : "a"(id));
+#else
+    __asm__ __volatile__("cpuid\n" : "=a"(out[0]), "=b"(out[1]), "=c"(out[2]), "=d"(out[3]) : "a"(id));
+#endif
+}
+
+static void cpuidex(uint32_t out[4], uint32_t id, uint32_t sid) {
+#if defined(_MSC_VER)
+    __cpuidex((int*)out, id, sid);
+#elif defined(__i386__) || defined(_M_IX86)
+    __asm__ __volatile__(
+        "movl %%ebx, %1\n"
+        "cpuid\n"
+        "xchgl %1, %%ebx\n"
+        : "=a"(out[0]), "=r"(out[1]), "=c"(out[2]), "=d"(out[3])
+        : "a"(id), "c"(sid));
+#else
+    __asm__ __volatile__("cpuid\n" : "=a"(out[0]), "=b"(out[1]), "=c"(out[2]), "=d"(out[3]) : "a"(id), "c"(sid));
+#endif
 }
 #endif
 
