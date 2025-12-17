@@ -335,8 +335,8 @@ void blake3_compress_xof_avx512(const uint32_t cv[8], const uint8_t block[BLAKE3
 void blake3_compress_in_place_avx512(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags) {
     __m128i rows[4];
     compress_pre(rows, cv, block, block_len, counter, flags);
-    storeu_128(xor_128(rows[0], rows[2]), (uint8_t*)&cv[0]);
-    storeu_128(xor_128(rows[1], rows[3]), (uint8_t*)&cv[4]);
+    storeu_128(xor_128(xor_128(rows[0], rows[2]), loadu_128((uint8_t*)&cv[0])), (uint8_t*)&cv[0]);
+    storeu_128(xor_128(xor_128(rows[1], rows[3]), loadu_128((uint8_t*)&cv[4])), (uint8_t*)&cv[4]);
 }
 
 /*
@@ -547,14 +547,14 @@ blake3_hash4_avx512(const uint8_t* const* inputs, size_t blocks, const uint32_t 
         round_fn4(v, msg_vecs, 4);
         round_fn4(v, msg_vecs, 5);
         round_fn4(v, msg_vecs, 6);
-        h_vecs[0] = xor_128(v[0], v[8]);
-        h_vecs[1] = xor_128(v[1], v[9]);
-        h_vecs[2] = xor_128(v[2], v[10]);
-        h_vecs[3] = xor_128(v[3], v[11]);
-        h_vecs[4] = xor_128(v[4], v[12]);
-        h_vecs[5] = xor_128(v[5], v[13]);
-        h_vecs[6] = xor_128(v[6], v[14]);
-        h_vecs[7] = xor_128(v[7], v[15]);
+        h_vecs[0] = xor_128(h_vecs[0], xor_128(v[0], v[8]));
+        h_vecs[1] = xor_128(h_vecs[1], xor_128(v[1], v[9]));
+        h_vecs[2] = xor_128(h_vecs[2], xor_128(v[2], v[10]));
+        h_vecs[3] = xor_128(h_vecs[3], xor_128(v[3], v[11]));
+        h_vecs[4] = xor_128(h_vecs[4], xor_128(v[4], v[12]));
+        h_vecs[5] = xor_128(h_vecs[5], xor_128(v[5], v[13]));
+        h_vecs[6] = xor_128(h_vecs[6], xor_128(v[6], v[14]));
+        h_vecs[7] = xor_128(h_vecs[7], xor_128(v[7], v[15]));
 
         block_flags = flags;
     }
@@ -833,14 +833,14 @@ blake3_hash8_avx512(const uint8_t* const* inputs, size_t blocks, const uint32_t 
         round_fn8(v, msg_vecs, 4);
         round_fn8(v, msg_vecs, 5);
         round_fn8(v, msg_vecs, 6);
-        h_vecs[0] = xor_256(v[0], v[8]);
-        h_vecs[1] = xor_256(v[1], v[9]);
-        h_vecs[2] = xor_256(v[2], v[10]);
-        h_vecs[3] = xor_256(v[3], v[11]);
-        h_vecs[4] = xor_256(v[4], v[12]);
-        h_vecs[5] = xor_256(v[5], v[13]);
-        h_vecs[6] = xor_256(v[6], v[14]);
-        h_vecs[7] = xor_256(v[7], v[15]);
+        h_vecs[0] = xor_256(h_vecs[0], xor_256(v[0], v[8]));
+        h_vecs[1] = xor_256(h_vecs[1], xor_256(v[1], v[9]));
+        h_vecs[2] = xor_256(h_vecs[2], xor_256(v[2], v[10]));
+        h_vecs[3] = xor_256(h_vecs[3], xor_256(v[3], v[11]));
+        h_vecs[4] = xor_256(h_vecs[4], xor_256(v[4], v[12]));
+        h_vecs[5] = xor_256(h_vecs[5], xor_256(v[5], v[13]));
+        h_vecs[6] = xor_256(h_vecs[6], xor_256(v[6], v[14]));
+        h_vecs[7] = xor_256(h_vecs[7], xor_256(v[7], v[15]));
 
         block_flags = flags;
     }
@@ -1188,14 +1188,14 @@ static void blake3_hash16_avx512(const uint8_t* const* inputs,
         round_fn16(v, msg_vecs, 4);
         round_fn16(v, msg_vecs, 5);
         round_fn16(v, msg_vecs, 6);
-        h_vecs[0] = xor_512(v[0], v[8]);
-        h_vecs[1] = xor_512(v[1], v[9]);
-        h_vecs[2] = xor_512(v[2], v[10]);
-        h_vecs[3] = xor_512(v[3], v[11]);
-        h_vecs[4] = xor_512(v[4], v[12]);
-        h_vecs[5] = xor_512(v[5], v[13]);
-        h_vecs[6] = xor_512(v[6], v[14]);
-        h_vecs[7] = xor_512(v[7], v[15]);
+        h_vecs[0] = xor_512(h_vecs[0], xor_512(v[0], v[8]));
+        h_vecs[1] = xor_512(h_vecs[1], xor_512(v[1], v[9]));
+        h_vecs[2] = xor_512(h_vecs[2], xor_512(v[2], v[10]));
+        h_vecs[3] = xor_512(h_vecs[3], xor_512(v[3], v[11]));
+        h_vecs[4] = xor_512(h_vecs[4], xor_512(v[4], v[12]));
+        h_vecs[5] = xor_512(h_vecs[5], xor_512(v[5], v[13]));
+        h_vecs[6] = xor_512(h_vecs[6], xor_512(v[6], v[14]));
+        h_vecs[7] = xor_512(h_vecs[7], xor_512(v[7], v[15]));
 
         block_flags = flags;
     }
