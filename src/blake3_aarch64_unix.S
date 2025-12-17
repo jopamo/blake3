@@ -33,6 +33,19 @@
     ror     \b, \b, #7
 .endm
 
+.macro round_seq m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15
+    // Column step
+    ldr w16, [x20, #(\m0 * 4)];  ldr w17, [x20, #(\m1 * 4)];  G w0, w4, w8,  w12, w16, w17
+    ldr w16, [x20, #(\m2 * 4)];  ldr w17, [x20, #(\m3 * 4)];  G w1, w5, w9,  w13, w16, w17
+    ldr w16, [x20, #(\m4 * 4)];  ldr w17, [x20, #(\m5 * 4)];  G w2, w6, w10, w14, w16, w17
+    ldr w16, [x20, #(\m6 * 4)];  ldr w17, [x20, #(\m7 * 4)];  G w3, w7, w11, w15, w16, w17
+    // Diagonal step
+    ldr w16, [x20, #(\m8 * 4)];  ldr w17, [x20, #(\m9 * 4)];  G w0, w5, w10, w15, w16, w17
+    ldr w16, [x20, #(\m10 * 4)]; ldr w17, [x20, #(\m11 * 4)]; G w1, w6, w11, w12, w16, w17
+    ldr w16, [x20, #(\m12 * 4)]; ldr w17, [x20, #(\m13 * 4)]; G w2, w7, w8,  w13, w16, w17
+    ldr w16, [x20, #(\m14 * 4)]; ldr w17, [x20, #(\m15 * 4)]; G w3, w4, w9,  w14, w16, w17
+.endm
+
 blake3_compress_in_place_neon:
     // Save callee-saved regs
     stp     x19, x20, [sp, #-16]!
@@ -63,85 +76,33 @@ blake3_compress_in_place_neon:
     movz    w11, #0xF53A
     movk    w11, #0xA54F, lsl #16
 
-    // Rounds
-    .irp r, 0, 1, 2, 3, 4, 5, 6
-        // Round \r
-        // Column step
-        .if \r == 0
-            ldr w16, [x20, #0];  ldr w17, [x20, #4];  G w0, w4, w8,  w12, w16, w17
-            ldr w16, [x20, #8];  ldr w17, [x20, #12]; G w1, w5, w9,  w13, w16, w17
-            ldr w16, [x20, #16]; ldr w17, [x20, #20]; G w2, w6, w10, w14, w16, w17
-            ldr w16, [x20, #24]; ldr w17, [x20, #28]; G w3, w7, w11, w15, w16, w17
-        .elif \r == 1
-            ldr w16, [x20, #8];  ldr w17, [x20, #24]; G w0, w4, w8,  w12, w16, w17
-            ldr w16, [x20, #12]; ldr w17, [x20, #40]; G w1, w5, w9,  w13, w16, w17
-            ldr w16, [x20, #28]; ldr w17, [x20, #0];  G w2, w6, w10, w14, w16, w17
-            ldr w16, [x20, #16]; ldr w17, [x20, #52]; G w3, w7, w11, w15, w16, w17
-        .elif \r == 2
-            ldr w16, [x20, #12]; ldr w17, [x20, #16]; G w0, w4, w8,  w12, w16, w17
-            ldr w16, [x20, #40]; ldr w17, [x20, #48]; G w1, w5, w9,  w13, w16, w17
-            ldr w16, [x20, #52]; ldr w17, [x20, #8];  G w2, w6, w10, w14, w16, w17
-            ldr w16, [x20, #28]; ldr w17, [x20, #56]; G w3, w7, w11, w15, w16, w17
-        .elif \r == 3
-            ldr w16, [x20, #40]; ldr w17, [x20, #28]; G w0, w4, w8,  w12, w16, w17
-            ldr w16, [x20, #48]; ldr w17, [x20, #36]; G w1, w5, w9,  w13, w16, w17
-            ldr w16, [x20, #56]; ldr w17, [x20, #12]; G w2, w6, w10, w14, w16, w17
-            ldr w16, [x20, #52]; ldr w17, [x20, #60]; G w3, w7, w11, w15, w16, w17
-        .elif \r == 4
-            ldr w16, [x20, #48]; ldr w17, [x20, #52]; G w0, w4, w8,  w12, w16, w17
-            ldr w16, [x20, #36]; ldr w17, [x20, #44]; G w1, w5, w9,  w13, w16, w17
-            ldr w16, [x20, #60]; ldr w17, [x20, #40]; G w2, w6, w10, w14, w16, w17
-            ldr w16, [x20, #56]; ldr w17, [x20, #32]; G w3, w7, w11, w15, w16, w17
-        .elif \r == 5
-            ldr w16, [x20, #36]; ldr w17, [x20, #56]; G w0, w4, w8,  w12, w16, w17
-            ldr w16, [x20, #44]; ldr w17, [x20, #20]; G w1, w5, w9,  w13, w16, w17
-            ldr w16, [x20, #32]; ldr w17, [x20, #48]; G w2, w6, w10, w14, w16, w17
-            ldr w16, [x20, #60]; ldr w17, [x20, #4];  G w3, w7, w11, w15, w16, w17
-        .elif \r == 6
-            ldr w16, [x20, #44]; ldr w17, [x20, #60]; G w0, w4, w8,  w12, w16, w17
-            ldr w16, [x20, #20]; ldr w17, [x20, #0];  G w1, w5, w9,  w13, w16, w17
-            ldr w16, [x20, #4];  ldr w17, [x20, #36]; G w2, w6, w10, w14, w16, w17
-            ldr w16, [x20, #32]; ldr w17, [x20, #24]; G w3, w7, w11, w15, w16, w17
-        .endif
+    // Round 0
+    // 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    round_seq 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 
-        // Diagonal step
-        .if \r == 0
-            ldr w16, [x20, #32]; ldr w17, [x20, #36]; G w0, w5, w10, w15, w16, w17
-            ldr w16, [x20, #40]; ldr w17, [x20, #44]; G w1, w6, w11, w12, w16, w17
-            ldr w16, [x20, #48]; ldr w17, [x20, #52]; G w2, w7, w8,  w13, w16, w17
-            ldr w16, [x20, #56]; ldr w17, [x20, #60]; G w3, w4, w9,  w14, w16, w17
-        .elif \r == 1
-            ldr w16, [x20, #4];  ldr w17, [x20, #44]; G w0, w5, w10, w15, w16, w17
-            ldr w16, [x20, #48]; ldr w17, [x20, #20]; G w1, w6, w11, w12, w16, w17
-            ldr w16, [x20, #36]; ldr w17, [x20, #56]; G w2, w7, w8,  w13, w16, w17
-            ldr w16, [x20, #60]; ldr w17, [x20, #32]; G w3, w4, w9,  w14, w16, w17
-        .elif \r == 2
-            ldr w16, [x20, #24]; ldr w17, [x20, #20]; G w0, w5, w10, w15, w16, w17
-            ldr w16, [x20, #36]; ldr w17, [x20, #0];  G w1, w6, w11, w12, w16, w17
-            ldr w16, [x20, #44]; ldr w17, [x20, #60]; G w2, w7, w8,  w13, w16, w17
-            ldr w16, [x20, #32]; ldr w17, [x20, #4];  G w3, w4, w9,  w14, w16, w17
-        .elif \r == 3
-            ldr w16, [x20, #16]; ldr w17, [x20, #0];  G w0, w5, w10, w15, w16, w17
-            ldr w16, [x20, #44]; ldr w17, [x20, #8];  G w1, w6, w11, w12, w16, w17
-            ldr w16, [x20, #20]; ldr w17, [x20, #32]; G w2, w7, w8,  w13, w16, w17
-            ldr w16, [x20, #4];  ldr w17, [x20, #24]; G w3, w4, w9,  w14, w16, w17
-        .elif \r == 4
-            ldr w16, [x20, #28]; ldr w17, [x20, #8];  G w0, w5, w10, w15, w16, w17
-            ldr w16, [x20, #20]; ldr w17, [x20, #12]; G w1, w6, w11, w12, w16, w17
-            ldr w16, [x20, #0];  ldr w17, [x20, #4];  G w2, w7, w8,  w13, w16, w17
-            ldr w16, [x20, #24]; ldr w17, [x20, #16]; G w3, w4, w9,  w14, w16, w17
-        .elif \r == 5
-            ldr w16, [x20, #52]; ldr w17, [x20, #12]; G w0, w5, w10, w15, w16, w17
-            ldr w16, [x20, #0];  ldr w17, [x20, #40]; G w1, w6, w11, w12, w16, w17
-            ldr w16, [x20, #8];  ldr w17, [x20, #24]; G w2, w7, w8,  w13, w16, w17
-            ldr w16, [x20, #16]; ldr w17, [x20, #28]; G w3, w4, w9,  w14, w16, w17
-        .elif \r == 6
-            ldr w16, [x20, #56]; ldr w17, [x20, #40]; G w0, w5, w10, w15, w16, w17
-            ldr w16, [x20, #8];  ldr w17, [x20, #12]; G w1, w6, w11, w12, w16, w17
-            ldr w16, [x20, #12]; ldr w17, [x20, #16]; G w2, w7, w8,  w13, w16, w17
-            ldr w16, [x20, #28]; ldr w17, [x20, #52]; G w3, w4, w9,  w14, w16, w17
-        .endif
-    .endr
+    // Round 1
+    // 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
+    round_seq 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
+
+    // Round 2
+    // 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
+    round_seq 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
+
+    // Round 3
+    // 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
+    round_seq 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
+
+    // Round 4
+    // 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
+    round_seq 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
+
+    // Round 5
+    // 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
+    round_seq 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
+
+    // Round 6
+    // 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
+    round_seq 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
 
     // Finalize: new_cv[i] = old_cv[i] ^ v[i] ^ v[i+8]
     // Load old CV values
