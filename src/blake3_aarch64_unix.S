@@ -118,34 +118,21 @@ blake3_compress_in_place_neon:
     // 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
     round_seq 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
 
-    // Finalize: new_cv[i] = old_cv[i] ^ v[i] ^ v[i+8]
-    // Load old CV values from x19
-    ldp     w16, w17, [x19, #0]
-    eor     w16, w16, w0
-    eor     w16, w16, w8
-    eor     w17, w17, w1
-    eor     w17, w17, w9
+    // Finalize: new_cv[i] = v[i] ^ v[i+8]
+    eor     w16, w0, w8
+    eor     w17, w1, w9
     stp     w16, w17, [x19, #0]
 
-    ldp     w16, w17, [x19, #8]
-    eor     w16, w16, w2
-    eor     w16, w16, w10
-    eor     w17, w17, w3
-    eor     w17, w17, w11
+    eor     w16, w2, w10
+    eor     w17, w3, w11
     stp     w16, w17, [x19, #8]
 
-    ldp     w16, w17, [x19, #16]
-    eor     w16, w16, w4
-    eor     w16, w16, w12
-    eor     w17, w17, w5
-    eor     w17, w17, w13
+    eor     w16, w4, w12
+    eor     w17, w5, w13
     stp     w16, w17, [x19, #16]
 
-    ldp     w16, w17, [x19, #24]
-    eor     w16, w16, w6
-    eor     w16, w16, w14
-    eor     w17, w17, w7
-    eor     w17, w17, w15
+    eor     w16, w6, w14
+    eor     w17, w7, w15
     stp     w16, w17, [x19, #24]
 
     // Restore callee-saved regs
