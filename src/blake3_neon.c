@@ -485,23 +485,143 @@ INLINE void hash_one_neon(const uint8_t* input, size_t blocks, const uint32_t ke
     memcpy(out, cv, BLAKE3_OUT_LEN);
 }
 
+INLINE void transpose_msg_vecs2(const uint8_t* const* inputs, size_t block_offset, uint32x4_t out[16]) {
+    for (int i = 0; i < 4; i++) {
+        uint32x4_t v0 = loadu_128(&inputs[0][block_offset + i * 16]);
+        uint32x4_t v1 = loadu_128(&inputs[1][block_offset + i * 16]);
+        uint32x4x2_t zip = vzipq_u32(v0, v1);
+        out[4 * i + 0] = zip.val[0];
+        out[4 * i + 1] = vextq_u32(zip.val[0], zip.val[0], 2);
+        out[4 * i + 2] = zip.val[1];
+        out[4 * i + 3] = vextq_u32(zip.val[1], zip.val[1], 2);
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    for (int i = 0; i < 2; ++i) {
+        __builtin_prefetch(&inputs[i][block_offset + 256]);
+    }
+#endif
+}
+
+INLINE void transpose_msg_vecs3(const uint8_t* const* inputs, size_t block_offset, uint32x4_t out[16]) {
+    for (int i = 0; i < 4; i++) {
+        uint32x4_t v0 = loadu_128(&inputs[0][block_offset + i * 16]);
+        uint32x4_t v1 = loadu_128(&inputs[1][block_offset + i * 16]);
+        uint32x4_t v2 = loadu_128(&inputs[2][block_offset + i * 16]);
+        uint32x4_t v3 = vdupq_n_u32(0);
+        uint32x4x2_t rows01 = vtrnq_u32(v0, v1);
+        uint32x4x2_t rows23 = vtrnq_u32(v2, v3);
+        out[4 * i + 0] = vcombine_u32(vget_low_u32(rows01.val[0]), vget_low_u32(rows23.val[0]));
+        out[4 * i + 1] = vcombine_u32(vget_low_u32(rows01.val[1]), vget_low_u32(rows23.val[1]));
+        out[4 * i + 2] = vcombine_u32(vget_high_u32(rows01.val[0]), vget_high_u32(rows23.val[0]));
+        out[4 * i + 3] = vcombine_u32(vget_high_u32(rows01.val[1]), vget_high_u32(rows23.val[1]));
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    for (int i = 0; i < 3; ++i) {
+        __builtin_prefetch(&inputs[i][block_offset + 256]);
+    }
+#endif
+}
+
 static void
 blake3_hash2_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t key[8], uint64_t counter, bool increment_counter, uint8_t flags, uint8_t flags_start, uint8_t flags_end, uint8_t* out) {
-    const uint8_t* const in4[4] = {inputs[0], inputs[1], inputs[0], inputs[0]};
-    uint8_t tmp[4 * BLAKE3_OUT_LEN];
-    blake3_hash4_neon(in4, blocks, key, counter, increment_counter, flags, flags_start, flags_end, tmp);
-    memcpy(out + 0 * BLAKE3_OUT_LEN, tmp + 0 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
-    memcpy(out + 1 * BLAKE3_OUT_LEN, tmp + 1 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+    uint32x4_t h_vecs[8] = {
+        set1_128(key[0]), set1_128(key[1]), set1_128(key[2]), set1_128(key[3]), set1_128(key[4]), set1_128(key[5]), set1_128(key[6]), set1_128(key[7]),
+    };
+    uint32x4_t counter_low_vec, counter_high_vec;
+    load_counters4(counter, increment_counter, &counter_low_vec, &counter_high_vec);
+    uint8_t block_flags = flags | flags_start;
+
+    for (size_t block = 0; block < blocks; block++) {
+        if (block + 1 == blocks) {
+            block_flags |= flags_end;
+        }
+        uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
+        uint32x4_t block_flags_vec = set1_128(block_flags);
+        uint32x4_t msg_vecs[16];
+        transpose_msg_vecs2(inputs, block * BLAKE3_BLOCK_LEN, msg_vecs);
+
+        uint32x4_t v[16] = {
+            h_vecs[0],       h_vecs[1],       h_vecs[2],       h_vecs[3],       h_vecs[4],       h_vecs[5],        h_vecs[6],     h_vecs[7],
+            set1_128(IV[0]), set1_128(IV[1]), set1_128(IV[2]), set1_128(IV[3]), counter_low_vec, counter_high_vec, block_len_vec, block_flags_vec,
+        };
+        round_fn4(v, msg_vecs, 0);
+        round_fn4(v, msg_vecs, 1);
+        round_fn4(v, msg_vecs, 2);
+        round_fn4(v, msg_vecs, 3);
+        round_fn4(v, msg_vecs, 4);
+        round_fn4(v, msg_vecs, 5);
+        round_fn4(v, msg_vecs, 6);
+        h_vecs[0] = xor_128(v[0], v[8]);
+        h_vecs[1] = xor_128(v[1], v[9]);
+        h_vecs[2] = xor_128(v[2], v[10]);
+        h_vecs[3] = xor_128(v[3], v[11]);
+        h_vecs[4] = xor_128(v[4], v[12]);
+        h_vecs[5] = xor_128(v[5], v[13]);
+        h_vecs[6] = xor_128(v[6], v[14]);
+        h_vecs[7] = xor_128(v[7], v[15]);
+        block_flags = flags;
+    }
+
+    transpose_vecs_128(&h_vecs[0]);
+    transpose_vecs_128(&h_vecs[4]);
+    // The first four vecs now contain the first half of each output, and the
+    // second four vecs contain the second half of each output.
+    storeu_128(h_vecs[0], &out[0 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[4], &out[1 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[1], &out[2 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[5], &out[3 * sizeof(uint32x4_t)]);
 }
 
 static void
 blake3_hash3_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t key[8], uint64_t counter, bool increment_counter, uint8_t flags, uint8_t flags_start, uint8_t flags_end, uint8_t* out) {
-    const uint8_t* const in4[4] = {inputs[0], inputs[1], inputs[2], inputs[0]};
-    uint8_t tmp[4 * BLAKE3_OUT_LEN];
-    blake3_hash4_neon(in4, blocks, key, counter, increment_counter, flags, flags_start, flags_end, tmp);
-    memcpy(out + 0 * BLAKE3_OUT_LEN, tmp + 0 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
-    memcpy(out + 1 * BLAKE3_OUT_LEN, tmp + 1 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
-    memcpy(out + 2 * BLAKE3_OUT_LEN, tmp + 2 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+    uint32x4_t h_vecs[8] = {
+        set1_128(key[0]), set1_128(key[1]), set1_128(key[2]), set1_128(key[3]), set1_128(key[4]), set1_128(key[5]), set1_128(key[6]), set1_128(key[7]),
+    };
+    uint32x4_t counter_low_vec, counter_high_vec;
+    load_counters4(counter, increment_counter, &counter_low_vec, &counter_high_vec);
+    uint8_t block_flags = flags | flags_start;
+
+    for (size_t block = 0; block < blocks; block++) {
+        if (block + 1 == blocks) {
+            block_flags |= flags_end;
+        }
+        uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
+        uint32x4_t block_flags_vec = set1_128(block_flags);
+        uint32x4_t msg_vecs[16];
+        transpose_msg_vecs3(inputs, block * BLAKE3_BLOCK_LEN, msg_vecs);
+
+        uint32x4_t v[16] = {
+            h_vecs[0],       h_vecs[1],       h_vecs[2],       h_vecs[3],       h_vecs[4],       h_vecs[5],        h_vecs[6],     h_vecs[7],
+            set1_128(IV[0]), set1_128(IV[1]), set1_128(IV[2]), set1_128(IV[3]), counter_low_vec, counter_high_vec, block_len_vec, block_flags_vec,
+        };
+        round_fn4(v, msg_vecs, 0);
+        round_fn4(v, msg_vecs, 1);
+        round_fn4(v, msg_vecs, 2);
+        round_fn4(v, msg_vecs, 3);
+        round_fn4(v, msg_vecs, 4);
+        round_fn4(v, msg_vecs, 5);
+        round_fn4(v, msg_vecs, 6);
+        h_vecs[0] = xor_128(v[0], v[8]);
+        h_vecs[1] = xor_128(v[1], v[9]);
+        h_vecs[2] = xor_128(v[2], v[10]);
+        h_vecs[3] = xor_128(v[3], v[11]);
+        h_vecs[4] = xor_128(v[4], v[12]);
+        h_vecs[5] = xor_128(v[5], v[13]);
+        h_vecs[6] = xor_128(v[6], v[14]);
+        h_vecs[7] = xor_128(v[7], v[15]);
+        block_flags = flags;
+    }
+
+    transpose_vecs_128(&h_vecs[0]);
+    transpose_vecs_128(&h_vecs[4]);
+    // The first four vecs now contain the first half of each output, and the
+    // second four vecs contain the second half of each output.
+    storeu_128(h_vecs[0], &out[0 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[4], &out[1 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[1], &out[2 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[5], &out[3 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[2], &out[4 * sizeof(uint32x4_t)]);
+    storeu_128(h_vecs[6], &out[5 * sizeof(uint32x4_t)]);
 }
 
 static void
