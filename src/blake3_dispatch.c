@@ -260,6 +260,10 @@ void blake3_compress_xof(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_
     }
 #endif
 #endif
+#if defined(__aarch64__) && BLAKE3_USE_NEON == 1
+    blake3_compress_xof_neon(cv, block, block_len, counter, flags, out);
+    return;
+#endif
     blake3_compress_xof_portable(cv, block, block_len, counter, flags, out);
 }
 
@@ -277,6 +281,17 @@ void blake3_xof_many(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN]
     }
 #endif
 #endif
+
+#if BLAKE3_USE_NEON == 1
+    {
+        const enum cpu_feature neon_features = get_cpu_features();
+        if (neon_features & NEON) {
+            blake3_xof_many_neon(cv, block, block_len, counter, flags, out, outblocks);
+            return;
+        }
+    }
+#endif
+
     for (size_t i = 0; i < outblocks; ++i) {
         blake3_compress_xof(cv, block, block_len, counter + i, flags, out + 64 * i);
     }

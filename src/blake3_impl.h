@@ -442,6 +442,11 @@ void blake3_xof_many_avx512(const uint32_t cv[8], const uint8_t block[BLAKE3_BLO
 #endif
 #endif
 
+#if defined(__aarch64__)
+void blake3_compress_in_place_neon(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags);
+void blake3_compress_xof_neon(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags, uint8_t out[64]);
+#endif
+
 #if BLAKE3_USE_NEON == 1
 void blake3_hash_many_neon(const uint8_t* const* inputs,
                            size_t num_inputs,
@@ -453,6 +458,8 @@ void blake3_hash_many_neon(const uint8_t* const* inputs,
                            uint8_t flags_start,
                            uint8_t flags_end,
                            uint8_t* out);
+
+void blake3_xof_many_neon(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags, uint8_t out[64], size_t outblocks);
 #endif
 
 #ifdef __cplusplus
