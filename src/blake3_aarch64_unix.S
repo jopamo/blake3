@@ -1,5 +1,6 @@
-// src/blake3_aarch64_unix.S
-// AArch64 scalar compress for blake3_compress_in_place_neon
+/* src/blake3_aarch64_unix.S
+ * AArch64 scalar compress for blake3_compress_in_place_neon
+ */
 
 #if defined(__aarch64__)
 
@@ -140,5 +141,112 @@ blake3_compress_in_place_neon:
     ret
 
 .size blake3_compress_in_place_neon, .-blake3_compress_in_place_neon
+
+/* Add near the top, alongside the existing symbol */
+.global blake3_compress_xof_neon
+.type blake3_compress_xof_neon, %function
+
+// void blake3_compress_xof_neon(
+//     const uint32_t cv[8],    // x0
+//     const uint8_t block[64], // x1
+//     uint8_t block_len,       // w2
+//     uint64_t counter,        // x3
+//     uint8_t flags,           // w4
+//     uint8_t out[64]          // x5
+// )
+
+blake3_compress_xof_neon:
+    // Save callee-saved regs we use
+    stp     x19, x20, [sp, #-16]!
+
+    // Capture args
+    mov     x19, x0          // cv ptr
+    mov     x20, x1          // block ptr
+    mov     w10, w2          // block_len temp
+    mov     x9,  x3          // counter temp
+    mov     w11, w4          // flags temp
+    // x5 = out ptr (caller-saved) keep as-is
+
+    // state[12..15]
+    mov     w12, w9          // counter_low
+    lsr     x9, x9, #32
+    mov     w13, w9          // counter_high
+    uxtb    w14, w10         // block_len
+    uxtb    w15, w11         // flags
+
+    // state[0..7] = cv
+    ldp     w0, w1, [x19, #0]
+    ldp     w2, w3, [x19, #8]
+    ldp     w4, w5, [x19, #16]
+    ldp     w6, w7, [x19, #24]
+
+    // Save original cv[0..7] for XOF high half
+    mov     w18, w0
+    mov     w19, w1
+    mov     w20, w2
+    mov     w21, w3
+    mov     w22, w4
+    mov     w23, w5
+    mov     w24, w6
+    mov     w25, w7
+
+    // state[8..11] = IV[0..3]
+    movz    w8,  #0xE667
+    movk    w8,  #0x6A09, lsl #16
+    movz    w9,  #0xAE85
+    movk    w9,  #0xBB67, lsl #16
+    movz    w10, #0xF372
+    movk    w10, #0x3C6E, lsl #16
+    movz    w11, #0xF53A
+    movk    w11, #0xA54F, lsl #16
+
+    // Rounds (same as your in-place function)
+    round_seq 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    round_seq 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
+    round_seq 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
+    round_seq 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
+    round_seq 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
+    round_seq 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
+    round_seq 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
+
+    // Output words 0..7: state[0..7] ^ state[8..15]
+    eor     w16, w0, w8
+    eor     w17, w1, w9
+    stp     w16, w17, [x5, #0]
+
+    eor     w16, w2, w10
+    eor     w17, w3, w11
+    stp     w16, w17, [x5, #8]
+
+    eor     w16, w4, w12
+    eor     w17, w5, w13
+    stp     w16, w17, [x5, #16]
+
+    eor     w16, w6, w14
+    eor     w17, w7, w15
+    stp     w16, w17, [x5, #24]
+
+    // Output words 8..15: state[8..15] ^ original_cv[0..7]
+    eor     w16, w8,  w18
+    eor     w17, w9,  w19
+    stp     w16, w17, [x5, #32]
+
+    eor     w16, w10, w20
+    eor     w17, w11, w21
+    stp     w16, w17, [x5, #40]
+
+    eor     w16, w12, w22
+    eor     w17, w13, w23
+    stp     w16, w17, [x5, #48]
+
+    eor     w16, w14, w24
+    eor     w17, w15, w25
+    stp     w16, w17, [x5, #56]
+
+    // Restore callee-saved regs and return
+    ldp     x19, x20, [sp], #16
+    ret
+
+.size blake3_compress_xof_neon, .-blake3_compress_xof_neon
 
 #endif

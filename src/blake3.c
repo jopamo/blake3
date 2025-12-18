@@ -1,3 +1,7 @@
+/* src/blake3.c
+ * Main BLAKE3 implementation and API functions
+ */
+
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
@@ -370,10 +374,10 @@ INLINE void blake3_hasher_update_base(blake3_hasher* self, const void* input, si
             // Avoid copying input into temporary buffers for full chunks; only buffer partial chunks at the tail
             if (subtree_len == BLAKE3_CHUNK_LEN) {
                 uint8_t cv[BLAKE3_OUT_LEN];
-                b3_hash_chunk_cv_impl(self->key, self->chunk.flags, input_bytes,
-                                      subtree_len, self->chunk.chunk_counter, false, cv);
+                b3_hash_chunk_cv_impl(self->key, self->chunk.flags, input_bytes, subtree_len, self->chunk.chunk_counter, false, cv);
                 hasher_push_cv(self, cv, self->chunk.chunk_counter);
-            } else {
+            }
+            else {
                 blake3_chunk_state chunk_state;
                 chunk_state_init(&chunk_state, self->key, self->chunk.flags);
                 chunk_state.chunk_counter = self->chunk.chunk_counter;
@@ -466,16 +470,11 @@ void blake3_hasher_reset(blake3_hasher* self) {
 }
 
 /* Internal primitives for parallel hashing */
-void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags,
-                      const uint8_t *chunk, size_t chunk_len,
-                      uint64_t chunk_index, bool is_root, uint8_t out_cv[32]) {
+void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t* chunk, size_t chunk_len, uint64_t chunk_index, bool is_root, uint8_t out_cv[32]) {
     /* For full chunks, use blake3_hash_many for optimal SIMD */
     if (chunk_len == BLAKE3_CHUNK_LEN) {
         const uint8_t* inputs[1] = {chunk};
-        blake3_hash_many(inputs, 1, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN,
-                        key, chunk_index, true,
-                        flags, CHUNK_START, CHUNK_END | (is_root ? ROOT : 0),
-                        out_cv);
+        blake3_hash_many(inputs, 1, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN, key, chunk_index, true, flags, CHUNK_START, CHUNK_END | (is_root ? ROOT : 0), out_cv);
         return;
     }
 
@@ -485,13 +484,12 @@ void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags,
     state.chunk_counter = chunk_index;
     chunk_state_update(&state, chunk, chunk_len);
     output_t output = chunk_state_output(&state);
-    if (is_root) output.flags |= ROOT;
+    if (is_root)
+        output.flags |= ROOT;
     output_chaining_value(&output, out_cv);
 }
 
-void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags,
-                       const uint8_t left_cv[32], const uint8_t right_cv[32],
-                       uint8_t out_cv[32]) {
+void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t left_cv[32], const uint8_t right_cv[32], uint8_t out_cv[32]) {
     /* Parent block is concatenation of two child CVs */
     uint8_t block[BLAKE3_BLOCK_LEN];
     memcpy(block, left_cv, 32);
@@ -499,17 +497,10 @@ void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags,
 
     /* Use blake3_hash_many with parent flags */
     const uint8_t* inputs[1] = {block};
-    blake3_hash_many(inputs, 1, 1,
-                    key, 0, false,
-                    (uint8_t)(flags | PARENT), 0, 0,
-                    out_cv);
+    blake3_hash_many(inputs, 1, 1, key, 0, false, (uint8_t)(flags | PARENT), 0, 0, out_cv);
 }
 
-void b3_output_root_impl(const uint32_t input_cv[8], uint8_t block_flags,
-                    const uint8_t *block, size_t block_len,
-                    uint64_t counter,
-                    uint64_t seek,
-                    uint8_t *out, size_t out_len) {
+void b3_output_root_impl(const uint32_t input_cv[8], uint8_t block_flags, const uint8_t* block, size_t block_len, uint64_t counter, uint64_t seek, uint8_t* out, size_t out_len) {
     output_t output = make_output(input_cv, block, block_len, counter, block_flags | ROOT);
     output_root_bytes(&output, seek, out, out_len);
 }

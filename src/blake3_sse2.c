@@ -1,3 +1,7 @@
+/* src/blake3_sse2.c
+ * SSE2 implementation of the compression function
+ */
+
 #include "blake3_impl.h"
 
 #include <immintrin.h>
