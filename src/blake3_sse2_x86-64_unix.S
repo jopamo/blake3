@@ -1,3 +1,7 @@
+/* src/blake3_sse2_x86-64_unix.S
+ * SSE2 assembly implementation for x86-64
+ */
+
 #if defined(__ELF__) && defined(__linux__)
 .section .note.GNU-stack,"",%progbits
 #endif

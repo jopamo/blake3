@@ -1,3 +1,7 @@
+/* src/blake3.h
+ * Public API header
+ */
+
 #ifndef BLAKE3_H
 #define BLAKE3_H
 

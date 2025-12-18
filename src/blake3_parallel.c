@@ -1,3 +1,7 @@
+/* src/blake3_parallel.c
+ * Parallel hashing implementation using threads
+ */
+
 #define _GNU_SOURCE
 
 #include "blake3_parallel.h"

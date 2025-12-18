@@ -1,15 +1,6 @@
-/*
- b3sum
-
- High-performance BLAKE3 checksum utility
-
- Design goals
- - saturate CPU and I/O in parallel
- - avoid per-file and per-chunk allocations in hot paths
- - prefer contiguous buffers (mmap or read-all) when possible
- - keep synchronization minimal and localized
- - scale well from tiny files to large multi-MiB inputs
-*/
+/* src/b3sum.c
+ * Command line utility for calculating BLAKE3 checksums
+ */
 
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L

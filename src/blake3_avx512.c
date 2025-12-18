@@ -1,3 +1,7 @@
+/* src/blake3_avx512.c
+ * AVX-512 implementation of the compression function
+ */
+
 #include "blake3_impl.h"
 
 #include <immintrin.h>

@@ -1,3 +1,7 @@
+/* src/blake3_portable.c
+ * Portable scalar implementation of the compression function
+ */
+
 #include "blake3_impl.h"
 #include <string.h>
 
