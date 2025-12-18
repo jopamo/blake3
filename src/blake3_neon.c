@@ -1,3 +1,7 @@
+/* src/blake3_neon.c
+ * ARM NEON implementation of the compression function
+ */
+
 #include "blake3_impl.h"
 
 #include <arm_neon.h>
@@ -371,6 +375,25 @@ INLINE void hash_one_neon(const uint8_t* input, size_t blocks, const uint32_t ke
     memcpy(out, cv, BLAKE3_OUT_LEN);
 }
 
+static void
+blake3_hash2_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t key[8], uint64_t counter, bool increment_counter, uint8_t flags, uint8_t flags_start, uint8_t flags_end, uint8_t* out) {
+    const uint8_t* const in4[4] = {inputs[0], inputs[1], inputs[0], inputs[0]};
+    uint8_t tmp[4 * BLAKE3_OUT_LEN];
+    blake3_hash4_neon(in4, blocks, key, counter, increment_counter, flags, flags_start, flags_end, tmp);
+    memcpy(out + 0 * BLAKE3_OUT_LEN, tmp + 0 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+    memcpy(out + 1 * BLAKE3_OUT_LEN, tmp + 1 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+}
+
+static void
+blake3_hash3_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t key[8], uint64_t counter, bool increment_counter, uint8_t flags, uint8_t flags_start, uint8_t flags_end, uint8_t* out) {
+    const uint8_t* const in4[4] = {inputs[0], inputs[1], inputs[2], inputs[0]};
+    uint8_t tmp[4 * BLAKE3_OUT_LEN];
+    blake3_hash4_neon(in4, blocks, key, counter, increment_counter, flags, flags_start, flags_end, tmp);
+    memcpy(out + 0 * BLAKE3_OUT_LEN, tmp + 0 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+    memcpy(out + 1 * BLAKE3_OUT_LEN, tmp + 1 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+    memcpy(out + 2 * BLAKE3_OUT_LEN, tmp + 2 * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+}
+
 void blake3_hash_many_neon(const uint8_t* const* inputs,
                            size_t num_inputs,
                            size_t blocks,
@@ -390,13 +413,19 @@ void blake3_hash_many_neon(const uint8_t* const* inputs,
         num_inputs -= 4;
         out = &out[4 * BLAKE3_OUT_LEN];
     }
-    while (num_inputs > 0) {
+
+    if (num_inputs == 3) {
+        blake3_hash3_neon(inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+        return;
+    }
+
+    if (num_inputs == 2) {
+        blake3_hash2_neon(inputs, blocks, key, counter, increment_counter, flags, flags_start, flags_end, out);
+        return;
+    }
+
+    if (num_inputs == 1) {
         hash_one_neon(inputs[0], blocks, key, counter, flags, flags_start, flags_end, out);
-        if (increment_counter) {
-            counter += 1;
-        }
-        inputs += 1;
-        num_inputs -= 1;
-        out = &out[BLAKE3_OUT_LEN];
+        return;
     }
 }
