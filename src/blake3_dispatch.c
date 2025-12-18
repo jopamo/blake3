@@ -1,3 +1,7 @@
+/* src/blake3_dispatch.c
+ * Runtime CPU feature detection and function dispatching
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -225,9 +229,9 @@ void blake3_compress_in_place(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_L
 #endif
 #endif
 
-#if defined(__aarch64__)
-    // blake3_compress_in_place_neon(cv, block, block_len, counter, flags);
-    // return;
+#if defined(__aarch64__) && BLAKE3_USE_NEON == 1
+    blake3_compress_in_place_neon(cv, block, block_len, counter, flags);
+    return;
 #endif
 
     blake3_compress_in_place_portable(cv, block, block_len, counter, flags);
