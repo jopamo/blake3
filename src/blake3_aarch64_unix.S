@@ -34,45 +34,35 @@
     ror     \b, \b, #7
 .endm
 
-.macro round_seq m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15
+.macro round_seq base, m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15
     // Column step
-    ldr w16, [x1, #(\m0 * 4)];  ldr w17, [x1, #(\m1 * 4)];  G w0, w4, w8,  w12, w16, w17
-    ldr w16, [x1, #(\m2 * 4)];  ldr w17, [x1, #(\m3 * 4)];  G w1, w5, w9,  w13, w16, w17
-    ldr w16, [x1, #(\m4 * 4)];  ldr w17, [x1, #(\m5 * 4)];  G w2, w6, w10, w14, w16, w17
-    ldr w16, [x1, #(\m6 * 4)];  ldr w17, [x1, #(\m7 * 4)];  G w3, w7, w11, w15, w16, w17
+    ldr w16, [\base, #(\m0 * 4)];  ldr w17, [\base, #(\m1 * 4)];  G w0, w4, w8,  w12, w16, w17
+    ldr w16, [\base, #(\m2 * 4)];  ldr w17, [\base, #(\m3 * 4)];  G w1, w5, w9,  w13, w16, w17
+    ldr w16, [\base, #(\m4 * 4)];  ldr w17, [\base, #(\m5 * 4)];  G w2, w6, w10, w14, w16, w17
+    ldr w16, [\base, #(\m6 * 4)];  ldr w17, [\base, #(\m7 * 4)];  G w3, w7, w11, w15, w16, w17
     // Diagonal step
-    ldr w16, [x1, #(\m8 * 4)];  ldr w17, [x1, #(\m9 * 4)];  G w0, w5, w10, w15, w16, w17
-    ldr w16, [x1, #(\m10 * 4)]; ldr w17, [x1, #(\m11 * 4)]; G w1, w6, w11, w12, w16, w17
-    ldr w16, [x1, #(\m12 * 4)]; ldr w17, [x1, #(\m13 * 4)]; G w2, w7, w8,  w13, w16, w17
-    ldr w16, [x1, #(\m14 * 4)]; ldr w17, [x1, #(\m15 * 4)]; G w3, w4, w9,  w14, w16, w17
+    ldr w16, [\base, #(\m8 * 4)];  ldr w17, [\base, #(\m9 * 4)];  G w0, w5, w10, w15, w16, w17
+    ldr w16, [\base, #(\m10 * 4)]; ldr w17, [\base, #(\m11 * 4)]; G w1, w6, w11, w12, w16, w17
+    ldr w16, [\base, #(\m12 * 4)]; ldr w17, [\base, #(\m13 * 4)]; G w2, w7, w8,  w13, w16, w17
+    ldr w16, [\base, #(\m14 * 4)]; ldr w17, [\base, #(\m15 * 4)]; G w3, w4, w9,  w14, w16, w17
 .endm
 
 blake3_compress_in_place_neon:
     // Save callee-saved regs
     stp     x19, x20, [sp, #-16]!
 
-    // Capture arguments in scratch registers immediately
-    // x0 = cv (ptr) -> moved to x19
-    // x1 = block (ptr) -> ALREADY IN PLACE for round_seq
-    // w2 = block_len -> saved to w10
-    // x3 = counter -> saved to x9
-    // w4 = flags -> saved to w11
-    
-    mov     x19, x0
-    // x20 is now unused for block pointer, just saved/restored
+    // Capture arguments
+    mov     x19, x0     // cv ptr
+    mov     x20, x1     // block ptr (saved to x20 before w1 clobber)
     mov     w10, w2
     mov     x9, x3
     mov     w11, w4
 
     // Initialize state[12..15] from saved arguments
-    // state[12] = counter_low
     mov     w12, w9
-    // state[13] = counter_high
     lsr     x9, x9, #32
     mov     w13, w9
-    // state[14] = block_len
     uxtb    w14, w10
-    // state[15] = flags
     uxtb    w15, w11
 
     // Initialize state[0..7] = cv[0..7] from x19
@@ -91,33 +81,14 @@ blake3_compress_in_place_neon:
     movz    w11, #0xF53A
     movk    w11, #0xA54F, lsl #16
 
-    // Round 0
-    // 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
-    round_seq 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
-
-    // Round 1
-    // 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
-    round_seq 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
-
-    // Round 2
-    // 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
-    round_seq 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
-
-    // Round 3
-    // 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
-    round_seq 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
-
-    // Round 4
-    // 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
-    round_seq 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
-
-    // Round 5
-    // 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
-    round_seq 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
-
-    // Round 6
-    // 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
-    round_seq 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
+    // 7 Rounds
+    round_seq x20, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    round_seq x20, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
+    round_seq x20, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
+    round_seq x20, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
+    round_seq x20, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
+    round_seq x20, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
+    round_seq x20, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
 
     // Finalize: new_cv[i] = v[i] ^ v[i+8]
     eor     w16, w0, w8
@@ -142,7 +113,6 @@ blake3_compress_in_place_neon:
 
 .size blake3_compress_in_place_neon, .-blake3_compress_in_place_neon
 
-/* Add near the top, alongside the existing symbol */
 .global blake3_compress_xof_neon
 .type blake3_compress_xof_neon, %function
 
@@ -156,7 +126,16 @@ blake3_compress_in_place_neon:
 // )
 
 blake3_compress_xof_neon:
-    stp     x19, xzr, [sp, #-16]!
+    stp     x19, x20, [sp, #-80]!
+    stp     x21, x22, [sp, #16]
+    stp     x23, x24, [sp, #32]
+    stp     x25, x26, [sp, #48]
+    stp     x27, x28, [sp, #64]
+
+    // Preserve critical pointers
+    mov     x27, x1  // block ptr
+    mov     x28, x5  // out ptr
+    mov     x9, x0   // cv ptr (temp)
 
     // state[12..15] from args
     mov     w12, w3
@@ -166,10 +145,10 @@ blake3_compress_xof_neon:
     uxtb    w15, w4
 
     // state[0..7] = cv
-    ldp     w0, w1, [x0, #0]
-    ldp     w2, w3, [x0, #8]
-    ldp     w4, w5, [x0, #16]
-    ldp     w6, w7, [x0, #24]
+    ldp     w0, w1, [x9, #0]
+    ldp     w2, w3, [x9, #8]
+    ldp     w4, w5, [x9, #16]
+    ldp     w6, w7, [x9, #24]
 
     // save original cv (w19..w26)
     mov     w19, w0
@@ -192,43 +171,48 @@ blake3_compress_xof_neon:
     movk    w11, #0xA54F, lsl #16
 
     // 7 rounds
-    round_seq 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
-    round_seq 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
-    round_seq 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
-    round_seq 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
-    round_seq 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
-    round_seq 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
-    round_seq 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
+    round_seq x27, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    round_seq x27, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8
+    round_seq x27, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1
+    round_seq x27, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6
+    round_seq x27, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4
+    round_seq x27, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7
+    round_seq x27, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13
 
     // out[0..31] = state[0..7] ^ state[8..15]
+    // Use x28 for out ptr
     eor     w16, w0, w8
     eor     w17, w1, w9
-    stp     w16, w17, [x5, #0]
+    stp     w16, w17, [x28, #0]
     eor     w16, w2, w10
     eor     w17, w3, w11
-    stp     w16, w17, [x5, #8]
+    stp     w16, w17, [x28, #8]
     eor     w16, w4, w12
     eor     w17, w5, w13
-    stp     w16, w17, [x5, #16]
+    stp     w16, w17, [x28, #16]
     eor     w16, w6, w14
     eor     w17, w7, w15
-    stp     w16, w17, [x5, #24]
+    stp     w16, w17, [x28, #24]
 
     // out[32..63] = state[8..15] ^ original_cv[0..7]
     eor     w16, w8,  w19
     eor     w17, w9,  w20
-    stp     w16, w17, [x5, #32]
+    stp     w16, w17, [x28, #32]
     eor     w16, w10, w21
     eor     w17, w11, w22
-    stp     w16, w17, [x5, #40]
+    stp     w16, w17, [x28, #40]
     eor     w16, w12, w23
     eor     w17, w13, w24
-    stp     w16, w17, [x5, #48]
+    stp     w16, w17, [x28, #48]
     eor     w16, w14, w25
     eor     w17, w15, w26
-    stp     w16, w17, [x5, #56]
+    stp     w16, w17, [x28, #56]
 
-    ldp     x19, xzr, [sp], #16
+    ldp     x21, x22, [sp, #16]
+    ldp     x23, x24, [sp, #32]
+    ldp     x25, x26, [sp, #48]
+    ldp     x27, x28, [sp, #64]
+    ldp     x19, x20, [sp], #80
     ret
 
 .size blake3_compress_xof_neon, .-blake3_compress_xof_neon
