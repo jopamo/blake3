@@ -52,14 +52,7 @@ INLINE uint32x4_t rot12_128(uint32x4_t x) {
 INLINE uint32x4_t rot8_128(uint32x4_t x) {
     // See comment in rot16_128.
     // return vorrq_u32(vshrq_n_u32(x, 8), vshlq_n_u32(x, 32 - 8));
-#if defined(__clang__)
-    return vreinterpretq_u32_u8(__builtin_shufflevector(vreinterpretq_u8_u32(x), vreinterpretq_u8_u32(x), 1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12));
-#elif __GNUC__ * 10000 + __GNUC_MINOR__ * 100 >= 40700
-    static const uint8x16_t r8 = {1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12};
-    return vreinterpretq_u32_u8(__builtin_shuffle(vreinterpretq_u8_u32(x), vreinterpretq_u8_u32(x), r8));
-#else
     return vsriq_n_u32(vshlq_n_u32(x, 32 - 8), x, 8);
-#endif
 }
 
 INLINE uint32x4_t rot7_128(uint32x4_t x) {
@@ -276,6 +269,11 @@ INLINE void transpose_msg_vecs4(const uint8_t* const* inputs, size_t block_offse
     out[13] = loadu_128(&inputs[1][block_offset + 3 * sizeof(uint32x4_t)]);
     out[14] = loadu_128(&inputs[2][block_offset + 3 * sizeof(uint32x4_t)]);
     out[15] = loadu_128(&inputs[3][block_offset + 3 * sizeof(uint32x4_t)]);
+#if defined(__GNUC__) || defined(__clang__)
+    for (size_t i = 0; i < 4; ++i) {
+        __builtin_prefetch(&inputs[i][block_offset + 256]);
+    }
+#endif
     transpose_vecs_128(&out[0]);
     transpose_vecs_128(&out[4]);
     transpose_vecs_128(&out[8]);
