@@ -352,6 +352,112 @@ blake3_hash4_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t ke
 
 void blake3_compress_in_place_portable(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags);
 
+INLINE void broadcast_msg_vecs4(const uint8_t* block, uint32x4_t out[16]) {
+    for (size_t i = 0; i < 16; ++i) {
+        out[i] = set1_128(load32(block + 4 * i));
+    }
+}
+
+void blake3_xof_many_neon(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags, uint8_t out[64], size_t outblocks) {
+    uint32x4_t key_vecs[8] = {
+        set1_128(cv[0]), set1_128(cv[1]), set1_128(cv[2]), set1_128(cv[3]), set1_128(cv[4]), set1_128(cv[5]), set1_128(cv[6]), set1_128(cv[7]),
+    };
+    uint32x4_t block_len_vec = set1_128(block_len);
+    uint32x4_t block_flags_vec = set1_128(flags | CHUNK_END | ROOT | CHUNK_START);
+
+    uint32x4_t msg_vecs[16];
+    broadcast_msg_vecs4(block, msg_vecs);
+
+    while (outblocks >= 4) {
+        uint32x4_t counter_low_vec, counter_high_vec;
+        load_counters4(counter, true, &counter_low_vec, &counter_high_vec);
+
+        uint32x4_t v[16] = {
+            key_vecs[0],     key_vecs[1],     key_vecs[2],     key_vecs[3],     key_vecs[4],     key_vecs[5],      key_vecs[6],   key_vecs[7],
+            set1_128(IV[0]), set1_128(IV[1]), set1_128(IV[2]), set1_128(IV[3]), counter_low_vec, counter_high_vec, block_len_vec, block_flags_vec,
+        };
+        round_fn4(v, msg_vecs, 0);
+        round_fn4(v, msg_vecs, 1);
+        round_fn4(v, msg_vecs, 2);
+        round_fn4(v, msg_vecs, 3);
+        round_fn4(v, msg_vecs, 4);
+        round_fn4(v, msg_vecs, 5);
+        round_fn4(v, msg_vecs, 6);
+
+        uint32x4_t out_low[8];
+        uint32x4_t out_high[8];
+
+        out_low[0] = xor_128(v[0], v[8]);
+        out_low[1] = xor_128(v[1], v[9]);
+        out_low[2] = xor_128(v[2], v[10]);
+        out_low[3] = xor_128(v[3], v[11]);
+        out_low[4] = xor_128(v[4], v[12]);
+        out_low[5] = xor_128(v[5], v[13]);
+        out_low[6] = xor_128(v[6], v[14]);
+        out_low[7] = xor_128(v[7], v[15]);
+
+        out_high[0] = xor_128(v[8], key_vecs[0]);
+        out_high[1] = xor_128(v[9], key_vecs[1]);
+        out_high[2] = xor_128(v[10], key_vecs[2]);
+        out_high[3] = xor_128(v[11], key_vecs[3]);
+        out_high[4] = xor_128(v[12], key_vecs[4]);
+        out_high[5] = xor_128(v[13], key_vecs[5]);
+        out_high[6] = xor_128(v[14], key_vecs[6]);
+        out_high[7] = xor_128(v[15], key_vecs[7]);
+
+        transpose_vecs_128(&out_low[0]);
+        transpose_vecs_128(&out_low[4]);
+        transpose_vecs_128(&out_high[0]);
+        transpose_vecs_128(&out_high[4]);
+
+        // Interleave output: low0, low4, high0, high4, low1, low5, high1, high5...
+        // But we want continuous 64 bytes per lane.
+        // out_low[0] is first 16 bytes of lane 0, 1, 2, 3.
+        // Wait, transpose_vecs_128 transposes 4x4 matrix of 32-bit elements.
+        // Input:
+        // out_low[0]: L0_w0, L1_w0, L2_w0, L3_w0
+        // ...
+        // out_low[3]: L0_w3, L1_w3, L2_w3, L3_w3
+        // After transpose:
+        // out_low[0]: L0_w0, L0_w1, L0_w2, L0_w3 (First 16 bytes of Lane 0)
+        // out_low[1]: L1_w0 ...
+
+        // We need to write 64 bytes for Lane 0:
+        // out_low[0], out_low[4], out_high[0], out_high[4]
+
+        storeu_128(out_low[0], out + 0 * 64 + 0);
+        storeu_128(out_low[4], out + 0 * 64 + 16);
+        storeu_128(out_high[0], out + 0 * 64 + 32);
+        storeu_128(out_high[4], out + 0 * 64 + 48);
+
+        storeu_128(out_low[1], out + 1 * 64 + 0);
+        storeu_128(out_low[5], out + 1 * 64 + 16);
+        storeu_128(out_high[1], out + 1 * 64 + 32);
+        storeu_128(out_high[5], out + 1 * 64 + 48);
+
+        storeu_128(out_low[2], out + 2 * 64 + 0);
+        storeu_128(out_low[6], out + 2 * 64 + 16);
+        storeu_128(out_high[2], out + 2 * 64 + 32);
+        storeu_128(out_high[6], out + 2 * 64 + 48);
+
+        storeu_128(out_low[3], out + 3 * 64 + 0);
+        storeu_128(out_low[7], out + 3 * 64 + 16);
+        storeu_128(out_high[3], out + 3 * 64 + 32);
+        storeu_128(out_high[7], out + 3 * 64 + 48);
+
+        counter += 4;
+        outblocks -= 4;
+        out += 4 * 64;
+    }
+
+    while (outblocks > 0) {
+        blake3_compress_xof_portable(cv, block, block_len, counter, flags, out);
+        counter += 1;
+        outblocks -= 1;
+        out += 64;
+    }
+}
+
 INLINE void hash_one_neon(const uint8_t* input, size_t blocks, const uint32_t key[8], uint64_t counter, uint8_t flags, uint8_t flags_start, uint8_t flags_end, uint8_t out[BLAKE3_OUT_LEN]) {
     uint32_t cv[8];
     memcpy(cv, key, BLAKE3_KEY_LEN);
