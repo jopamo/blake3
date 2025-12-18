@@ -451,7 +451,11 @@ void blake3_xof_many_neon(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK
     }
 
     while (outblocks > 0) {
+#if defined(__aarch64__)
+        blake3_compress_xof_neon(cv, block, block_len, counter, flags, out);
+#else
         blake3_compress_xof_portable(cv, block, block_len, counter, flags, out);
+#endif
         counter += 1;
         outblocks -= 1;
         out += 64;
@@ -466,7 +470,7 @@ INLINE void hash_one_neon(const uint8_t* input, size_t blocks, const uint32_t ke
         if (blocks == 1) {
             block_flags |= flags_end;
         }
-#if defined(__aarch64__)
+#if defined(__aarch64__) && BLAKE3_USE_NEON == 1
         blake3_compress_in_place_neon(cv, input, BLAKE3_BLOCK_LEN, counter, block_flags);
 #else
         // TODO: Implement compress_neon. However note that according to
