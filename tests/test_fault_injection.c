@@ -532,7 +532,7 @@ void test_public_api_context(void) {
     // Check defaults: nthreads=0, min_parallel_bytes=64KiB, sample mask=63, subtree_chunks default, etc
     b3p_config_t cfg = b3p_config_default();
     assert(cfg.nthreads == 0);
-    assert(cfg.min_parallel_bytes == 64 * 1024);  // 64KiB
+    assert(cfg.min_parallel_bytes == 16 * 1024);  // 16KiB
     assert(cfg.autotune_sample_mask == 63);
     assert(cfg.subtree_chunks == B3P_DEFAULT_SUBTREE_CHUNKS);
 

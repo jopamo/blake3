@@ -383,7 +383,7 @@ size_t blake3_simd_degree(void) {
     {
         const enum cpu_feature neon_features = get_cpu_features();
         if (neon_features & NEON) {
-            return 4;
+            return 8;
         }
     }
 #endif

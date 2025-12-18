@@ -264,13 +264,13 @@ b3p_config_t b3p_config_default(void) {
         .nthreads = 0,
 
         // Avoid parallel overhead on small inputs
-        .min_parallel_bytes = 64u * 1024u,
+        .min_parallel_bytes = 16u * 1024u,
 
         // Method A: require enough chunks to amortize scheduling
-        .method_a_min_chunks = 16u,
+        .method_a_min_chunks = 4u,
 
         // Method B: require enough per-thread work to keep workers busy
-        .method_b_min_chunks_per_thread = 64u,
+        .method_b_min_chunks_per_thread = 16u,
 
         // Subtree size used for reducing intermediate CVs
         .subtree_chunks = B3P_DEFAULT_SUBTREE_CHUNKS,
@@ -1319,10 +1319,10 @@ static int b3p_run_method_a_chunks(struct b3p_ctx* ctx, b3_cv_bytes_t* out_root,
 
     // Batch size amortizes scheduling and reduction overhead
     // Larger batches reduce queue pressure, but increase per-task latency
-    size_t batch_step = simd_degree * 64;
+    size_t batch_step = simd_degree * 8;
 
     // Guard multiplication overflow, fall back to a conservative batch size
-    if (batch_step / 64 != simd_degree) {
+    if (batch_step / 8 != simd_degree) {
         batch_step = 64;
     }
     if (batch_step == 0) {
@@ -1373,8 +1373,8 @@ static int b3p_run_method_a_chunks(struct b3p_ctx* ctx, b3_cv_bytes_t* out_root,
         b3p_task_hash_chunks(&job);
     }
     else {
-        // Submit one long-lived worker task per thread
-        for (size_t t = 0; t < tasks; t++) {
+        // Submit tasks to the pool, leaving one for the calling thread
+        for (size_t t = 0; t < tasks - 1; t++) {
             if (b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_chunks, &job) != 0) {
                 // If submission fails, wait for any already-submitted work to drain
                 b3p_taskgroup_wait(&g);
@@ -1382,6 +1382,9 @@ static int b3p_run_method_a_chunks(struct b3p_ctx* ctx, b3_cv_bytes_t* out_root,
                 return -1;
             }
         }
+
+        // Calling thread participates in the work
+        b3p_task_hash_chunks(&job);
 
         // Wait until all submitted worker tasks report completion
         b3p_taskgroup_wait(&g);
@@ -1461,8 +1464,8 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx* ctx, b3_cv_bytes_t* out_roo
         b3p_task_hash_subtrees(&job);
     }
     else {
-        // Submit one long-lived worker task per thread
-        for (size_t t = 0; t < tasks; t++) {
+        // Submit tasks to the pool, leaving one for the calling thread
+        for (size_t t = 0; t < tasks - 1; t++) {
             if (b3p_pool_submit(&ctx->pool, &g, b3p_task_hash_subtrees, &job) != 0) {
                 // If submission fails, wait for any already-submitted work to drain
                 b3p_taskgroup_wait(&g);
@@ -1470,6 +1473,9 @@ static int b3p_run_method_b_subtrees(struct b3p_ctx* ctx, b3_cv_bytes_t* out_roo
                 return -1;
             }
         }
+
+        // Calling thread participates in the work
+        b3p_task_hash_subtrees(&job);
 
         // Wait until all subtrees have been processed
         b3p_taskgroup_wait(&g);
