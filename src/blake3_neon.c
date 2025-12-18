@@ -31,12 +31,15 @@ INLINE uint32x4_t xor_128(uint32x4_t a, uint32x4_t b) {
 }
 
 INLINE uint32x4_t set1_128(uint32_t x) {
-    return vld1q_dup_u32(&x);
+    return vdupq_n_u32(x);
 }
 
 INLINE uint32x4_t set4(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    uint32_t array[4] = {a, b, c, d};
-    return vld1q_u32(array);
+    uint32x4_t v = vdupq_n_u32(a);
+    v = vsetq_lane_u32(b, v, 1);
+    v = vsetq_lane_u32(c, v, 2);
+    v = vsetq_lane_u32(d, v, 3);
+    return v;
 }
 
 INLINE uint32x4_t rot16_128(uint32x4_t x) {
@@ -285,9 +288,21 @@ INLINE void transpose_msg_vecs4(const uint8_t* const* inputs, size_t block_offse
 }
 
 INLINE void load_counters4(uint64_t counter, bool increment_counter, uint32x4_t* out_low, uint32x4_t* out_high) {
-    uint64_t mask = (increment_counter ? ~0 : 0);
-    *out_low = set4(counter_low(counter + (mask & 0)), counter_low(counter + (mask & 1)), counter_low(counter + (mask & 2)), counter_low(counter + (mask & 3)));
-    *out_high = set4(counter_high(counter + (mask & 0)), counter_high(counter + (mask & 1)), counter_high(counter + (mask & 2)), counter_high(counter + (mask & 3)));
+    if (!increment_counter) {
+        uint32_t lo = counter_low(counter);
+        uint32_t hi = counter_high(counter);
+        *out_low = vdupq_n_u32(lo);
+        *out_high = vdupq_n_u32(hi);
+        return;
+    }
+
+    // Use 64-bit lanes so carries from the low words automatically flow into the high words.
+    const uint64x2_t offsets01 = {0, 1};
+    uint64x2_t ctr01 = vaddq_u64(vdupq_n_u64(counter), offsets01);
+    uint64x2_t ctr23 = vaddq_u64(vdupq_n_u64(counter + 2), offsets01);
+
+    *out_low = vcombine_u32(vmovn_u64(ctr01), vmovn_u64(ctr23));
+    *out_high = vcombine_u32(vshrn_n_u64(ctr01, 32), vshrn_n_u64(ctr23, 32));
 }
 
 static void
@@ -298,12 +313,12 @@ blake3_hash4_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t ke
     uint32x4_t counter_low_vec, counter_high_vec;
     load_counters4(counter, increment_counter, &counter_low_vec, &counter_high_vec);
     uint8_t block_flags = flags | flags_start;
+    const uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
 
     for (size_t block = 0; block < blocks; block++) {
         if (block + 1 == blocks) {
             block_flags |= flags_end;
         }
-        uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
         uint32x4_t block_flags_vec = set1_128(block_flags);
         uint32x4_t msg_vecs[16];
         transpose_msg_vecs4(inputs, block * BLAKE3_BLOCK_LEN, msg_vecs);
@@ -530,12 +545,12 @@ blake3_hash2_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t ke
     uint32x4_t counter_low_vec, counter_high_vec;
     load_counters4(counter, increment_counter, &counter_low_vec, &counter_high_vec);
     uint8_t block_flags = flags | flags_start;
+    const uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
 
     for (size_t block = 0; block < blocks; block++) {
         if (block + 1 == blocks) {
             block_flags |= flags_end;
         }
-        uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
         uint32x4_t block_flags_vec = set1_128(block_flags);
         uint32x4_t msg_vecs[16];
         transpose_msg_vecs2(inputs, block * BLAKE3_BLOCK_LEN, msg_vecs);
@@ -580,12 +595,12 @@ blake3_hash3_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t ke
     uint32x4_t counter_low_vec, counter_high_vec;
     load_counters4(counter, increment_counter, &counter_low_vec, &counter_high_vec);
     uint8_t block_flags = flags | flags_start;
+    const uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
 
     for (size_t block = 0; block < blocks; block++) {
         if (block + 1 == blocks) {
             block_flags |= flags_end;
         }
-        uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
         uint32x4_t block_flags_vec = set1_128(block_flags);
         uint32x4_t msg_vecs[16];
         transpose_msg_vecs3(inputs, block * BLAKE3_BLOCK_LEN, msg_vecs);
@@ -637,12 +652,12 @@ blake3_hash8_neon(const uint8_t* const* inputs, size_t blocks, const uint32_t ke
     uint32x4_t counter_low_vec_b, counter_high_vec_b;
     load_counters4(counter + (increment_counter ? 4 : 0), increment_counter, &counter_low_vec_b, &counter_high_vec_b);
     uint8_t block_flags = flags | flags_start;
+    const uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
 
     for (size_t block = 0; block < blocks; block++) {
         if (block + 1 == blocks) {
             block_flags |= flags_end;
         }
-        uint32x4_t block_len_vec = set1_128(BLAKE3_BLOCK_LEN);
         uint32x4_t block_flags_vec = set1_128(block_flags);
         uint32x4_t msg_vecs_a[16];
         transpose_msg_vecs4(inputs, block * BLAKE3_BLOCK_LEN, msg_vecs_a);
