@@ -1,3 +1,7 @@
+/* src/blake3_impl.h
+ * Internal implementation details and definitions
+ */
+
 #ifndef BLAKE3_IMPL_H
 #define BLAKE3_IMPL_H
 
@@ -233,7 +237,6 @@ BLAKE3_PRIVATE size_t blake3_compress_subtree_wide(const uint8_t* input, size_t 
 INLINE void chunk_state_init(blake3_chunk_state* self, const uint32_t key[8], uint8_t flags) {
     memcpy(self->cv, key, BLAKE3_KEY_LEN);
     self->chunk_counter = 0;
-    memset(self->buf, 0, BLAKE3_BLOCK_LEN);
     self->buf_len = 0;
     self->blocks_compressed = 0;
     self->flags = flags;
@@ -243,7 +246,6 @@ INLINE void chunk_state_reset(blake3_chunk_state* self, const uint32_t key[8], u
     memcpy(self->cv, key, BLAKE3_KEY_LEN);
     self->chunk_counter = chunk_counter;
     self->blocks_compressed = 0;
-    memset(self->buf, 0, BLAKE3_BLOCK_LEN);
     self->buf_len = 0;
 }
 
@@ -282,7 +284,8 @@ typedef struct {
 INLINE output_t make_output(const uint32_t input_cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags) {
     output_t ret;
     memcpy(ret.input_cv, input_cv, 32);
-    memcpy(ret.block, block, BLAKE3_BLOCK_LEN);
+    memcpy(ret.block, block, block_len);
+    memset(ret.block + block_len, 0, BLAKE3_BLOCK_LEN - block_len);
     ret.block_len = block_len;
     ret.counter = counter;
     ret.flags = flags;
@@ -333,7 +336,6 @@ INLINE void chunk_state_update(blake3_chunk_state* self, const uint8_t* input, s
             blake3_compress_in_place(self->cv, self->buf, BLAKE3_BLOCK_LEN, self->chunk_counter, self->flags | chunk_state_maybe_start_flag(self));
             self->blocks_compressed += 1;
             self->buf_len = 0;
-            memset(self->buf, 0, BLAKE3_BLOCK_LEN);
         }
     }
 
@@ -357,17 +359,9 @@ INLINE output_t parent_output(const uint8_t block[BLAKE3_BLOCK_LEN], const uint3
 }
 
 /* Internal primitives for parallel hashing */
-BLAKE3_PRIVATE void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags,
-                                     const uint8_t *chunk, size_t chunk_len,
-                                     uint64_t chunk_index, bool is_root, uint8_t out_cv[32]);
-BLAKE3_PRIVATE void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags,
-                                      const uint8_t left_cv[32], const uint8_t right_cv[32],
-                                      uint8_t out_cv[32]);
-BLAKE3_PRIVATE void b3_output_root_impl(const uint32_t input_cv[8], uint8_t block_flags,
-                                   const uint8_t *block, size_t block_len,
-                                   uint64_t counter,
-                                   uint64_t seek,
-                                   uint8_t *out, size_t out_len);
+BLAKE3_PRIVATE void b3_hash_chunk_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t* chunk, size_t chunk_len, uint64_t chunk_index, bool is_root, uint8_t out_cv[32]);
+BLAKE3_PRIVATE void b3_hash_parent_cv_impl(const uint32_t key[8], uint8_t flags, const uint8_t left_cv[32], const uint8_t right_cv[32], uint8_t out_cv[32]);
+BLAKE3_PRIVATE void b3_output_root_impl(const uint32_t input_cv[8], uint8_t block_flags, const uint8_t* block, size_t block_len, uint64_t counter, uint64_t seek, uint8_t* out, size_t out_len);
 
 // Declarations for implementation-specific functions.
 void blake3_compress_in_place_portable(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN], uint8_t block_len, uint64_t counter, uint8_t flags);
