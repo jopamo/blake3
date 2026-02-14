@@ -4,9 +4,6 @@
 # Ignore static libraries
 *.a
 
-# Ignore the final executable binary
-traceroute/traceroute
-
 # Ignore build directories (if applicable)
 build*
 out/
