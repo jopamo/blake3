@@ -26,7 +26,6 @@
 
 #include "blake3.h"
 #include "blake3_parallel.h"
-#include "blake3_impl.h"
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -303,19 +302,10 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
     }
 
     if (input_buf) {
-        uint8_t iv_bytes[BLAKE3_KEY_LEN];
-        for (size_t i = 0; i < 8; i++) {
-            uint32_t w = IV[i];
-            iv_bytes[i * 4 + 0] = (uint8_t)(w >> 0);
-            iv_bytes[i * 4 + 1] = (uint8_t)(w >> 8);
-            iv_bytes[i * 4 + 2] = (uint8_t)(w >> 16);
-            iv_bytes[i * 4 + 3] = (uint8_t)(w >> 24);
-        }
-
         /* Small-file fast path
            Avoids parallel engine setup overhead for latency-sensitive sizes */
         if ((size_t)ctx.size <= (1024 * 1024)) {
-            int rc = b3p_hash_buffer_serial(input_buf, (size_t)ctx.size, iv_bytes, 0, out_hash, BLAKE3_OUT_LEN);
+            int rc = b3p_hash_unkeyed_buffer_serial(input_buf, (size_t)ctx.size, out_hash, BLAKE3_OUT_LEN);
             if (ctx.map)
                 munmap((void*)ctx.map, ctx.map_len);
             if (rc != 0) {
@@ -351,7 +341,7 @@ static int hash_regular_file_parallel(const program_opts* opts, const char* name
             return -1;
         }
 
-        int rc = b3p_hash_one_shot(b3p, input_buf, (size_t)ctx.size, iv_bytes, 0, B3P_METHOD_AUTO, out_hash, BLAKE3_OUT_LEN);
+        int rc = b3p_hash_unkeyed(b3p, input_buf, (size_t)ctx.size, B3P_METHOD_AUTO, out_hash, BLAKE3_OUT_LEN);
         b3p_destroy(b3p);
 
         if (ctx.map)

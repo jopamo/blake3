@@ -283,10 +283,28 @@ b3p_config_t b3p_config_default(void) {
     };
 }
 
+static int b3p_validate_and_pack_flags(b3p_flags_t flags, uint8_t* out_flags) {
+    if (!out_flags) {
+        return -1;
+    }
+    if ((flags & ~0xFFu) != 0u) {
+        return -1;
+    }
+    *out_flags = (uint8_t)flags;
+    return 0;
+}
+
+static void b3p_iv_bytes(uint8_t out[BLAKE3_KEY_LEN]) {
+    for (size_t i = 0; i < 8; i++) {
+        store32(out + (i * 4), IV[i]);
+    }
+}
+
 b3p_ctx_t* b3p_create(const b3p_config_t* cfg) {
-    // Reject a NULL config pointer early
+    b3p_config_t default_cfg;
     if (!cfg) {
-        return NULL;
+        default_cfg = b3p_config_default();
+        cfg = &default_cfg;
     }
 
     // Allocate and zero-init the context so cleanup paths are simple
@@ -368,30 +386,72 @@ void b3p_destroy(b3p_ctx_t* vctx) {
     free(ctx);
 }
 
-int b3p_hash_one_shot(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], uint8_t flags, b3p_method_t method, uint8_t* out, size_t out_len) {
-    // Preserve behavior by delegating to the seekable implementation at offset 0
-    // This keeps a single implementation for all one-shot hashing paths
-    return b3p_hash_one_shot_seek(ctx, input, input_len, key, flags, method, 0, out, out_len);
+int b3p_hash_one_shot(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t cv[BLAKE3_KEY_LEN], b3p_flags_t flags, b3p_method_t method, uint8_t* out, size_t out_len) {
+    return b3p_hash_raw_cv_one_shot(ctx, input, input_len, cv, flags, method, out, out_len);
 }
 
-int b3p_hash_one_shot_seek(b3p_ctx_t* vctx,
+int b3p_hash_one_shot_seek(b3p_ctx_t* ctx,
                            const uint8_t* input,
                            size_t input_len,
-                           const uint8_t key[BLAKE3_KEY_LEN],
-                           uint8_t flags,
+                           const uint8_t cv[BLAKE3_KEY_LEN],
+                           b3p_flags_t flags,
                            b3p_method_t method,
                            uint64_t seek,
                            uint8_t* out,
                            size_t out_len) {
-    // Validate required pointers for any non-trivial work
+    return b3p_hash_raw_cv_one_shot_seek(ctx, input, input_len, cv, flags, method, seek, out, out_len);
+}
+
+int b3p_hash_unkeyed(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, b3p_method_t method, uint8_t* out, size_t out_len) {
+    return b3p_hash_unkeyed_seek(ctx, input, input_len, method, 0, out, out_len);
+}
+
+int b3p_hash_unkeyed_seek(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, b3p_method_t method, uint64_t seek, uint8_t* out, size_t out_len) {
+    uint8_t iv_bytes[BLAKE3_KEY_LEN];
+    b3p_iv_bytes(iv_bytes);
+    return b3p_hash_raw_cv_one_shot_seek(ctx, input, input_len, iv_bytes, 0, method, seek, out, out_len);
+}
+
+int b3p_hash_keyed(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], b3p_method_t method, uint8_t* out, size_t out_len) {
+    return b3p_hash_keyed_seek(ctx, input, input_len, key, method, 0, out, out_len);
+}
+
+int b3p_hash_keyed_seek(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], b3p_method_t method, uint64_t seek, uint8_t* out, size_t out_len) {
+    return b3p_hash_raw_cv_one_shot_seek(ctx, input, input_len, key, KEYED_HASH, method, seek, out, out_len);
+}
+
+int b3p_hash_raw_cv_one_shot(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t cv[BLAKE3_KEY_LEN], b3p_flags_t flags, b3p_method_t method, uint8_t* out, size_t out_len) {
+    return b3p_hash_raw_cv_one_shot_seek(ctx, input, input_len, cv, flags, method, 0, out, out_len);
+}
+
+int b3p_hash_raw_cv_one_shot_seek(b3p_ctx_t* vctx,
+                                  const uint8_t* input,
+                                  size_t input_len,
+                                  const uint8_t cv[BLAKE3_KEY_LEN],
+                                  b3p_flags_t flags,
+                                  b3p_method_t method,
+                                  uint64_t seek,
+                                  uint8_t* out,
+                                  size_t out_len) {
     struct b3p_ctx* ctx = (struct b3p_ctx*)vctx;
-    if (!ctx || !input || !out || !key) {
+    if (!ctx || !cv) {
+        return -1;
+    }
+    if (out_len > 0 && !out) {
+        return -1;
+    }
+    if (input_len > 0 && !input) {
         return -1;
     }
 
     // A zero-length output request is always a no-op success
     if (out_len == 0) {
         return 0;
+    }
+
+    uint8_t packed_flags = 0;
+    if (b3p_validate_and_pack_flags(flags, &packed_flags) != 0) {
+        return -1;
     }
 
     // Stash the input range on the context for downstream helpers
@@ -418,23 +478,23 @@ int b3p_hash_one_shot_seek(b3p_ctx_t* vctx,
 
     ctx->num_chunks = num_chunks;
 
-    // Convert key bytes to little-endian u32 words once per call
+    // Convert CV bytes to little-endian u32 words once per call
     // The hashing core consumes the key as 8 u32 words
     for (size_t i = 0; i < 8; i++) {
         uint32_t w = 0;
-        w |= (uint32_t)key[i * 4 + 0] << 0;
-        w |= (uint32_t)key[i * 4 + 1] << 8;
-        w |= (uint32_t)key[i * 4 + 2] << 16;
-        w |= (uint32_t)key[i * 4 + 3] << 24;
+        w |= (uint32_t)cv[i * 4 + 0] << 0;
+        w |= (uint32_t)cv[i * 4 + 1] << 8;
+        w |= (uint32_t)cv[i * 4 + 2] << 16;
+        w |= (uint32_t)cv[i * 4 + 3] << 24;
         ctx->kf.key[i] = w;
     }
 
     // Store flags for this call
-    ctx->kf.flags = flags;
+    ctx->kf.flags = packed_flags;
 
 #if DEBUG_PARALLEL
     // Debug trace for selecting parallel strategies
-    fprintf(stderr, "[parallel] flags: %02x input_len=%zu num_chunks=%zu\n", flags, input_len, ctx->num_chunks);
+    fprintf(stderr, "[parallel] flags: %02x input_len=%zu num_chunks=%zu\n", packed_flags, input_len, ctx->num_chunks);
 #endif
 
     // Resolve AUTO into a concrete method based on current input/cfg
@@ -453,8 +513,10 @@ int b3p_hash_one_shot_seek(b3p_ctx_t* vctx,
         // One-shot root always starts at chunk counter 0
         state.chunk_counter = 0;
 
-        // Feed the chunk (possibly empty) into the state
-        chunk_state_update(&state, ctx->input, ctx->input_len);
+        // Feed the chunk (possibly empty) into the state.
+        // Keep the pointer non-NULL for zero-length inputs to avoid libc edge-case UB.
+        const uint8_t* state_input = ctx->input_len ? ctx->input : (const uint8_t*)"";
+        chunk_state_update(&state, state_input, ctx->input_len);
 
         // Produce the output descriptor for the root
         output_t output = chunk_state_output(&state);
@@ -1189,6 +1251,7 @@ static void b3p_reduce_stack(struct b3p_ctx* ctx,
     // 64 is enough for any realistic input sizes, but keep a guard anyway
     size_t stack_counts[64];
     size_t top = 0;
+    int split_children_captured = 0;
 
     // Compute total_count across all CVs, accounting for a shorter last subtree
     size_t total_count = 0;
@@ -1253,15 +1316,16 @@ static void b3p_reduce_stack(struct b3p_ctx* ctx,
             // This merge is the root only if it's the final reduction and spans the whole input
             int is_root = (is_final && new_count == total_count);
 
-            // If the caller wants split children, capture them at the root merge boundary
-            if (is_root && out_split_children) {
+            // If the caller wants split children, capture them at the root merge boundary.
+            // Keep reducing so out_root is always produced for successful calls.
+            if (is_root && out_split_children && !split_children_captured) {
                 out_split_children[0] = cvs[left_idx];
                 out_split_children[1] = cvs[right_idx];
-                return;
+                split_children_captured = 1;
             }
 
             // Merge child CVs into the parent CV in-place at left_idx
-            b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, &cvs[left_idx], &cvs[right_idx], &cvs[left_idx], is_root);
+            b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, &cvs[left_idx], &cvs[right_idx], &cvs[left_idx], is_root && !out_split_children);
 
             // Replace the left count with the combined count and pop the right entry
             stack_counts[left_idx] = new_count;
@@ -1283,15 +1347,16 @@ static void b3p_reduce_stack(struct b3p_ctx* ctx,
         // Root detection matches the lazy-merge logic above
         int is_root = (is_final && new_count == total_count);
 
-        // Optionally expose the two children that form the final root parent
-        if (is_root && out_split_children) {
+        // Optionally expose the two children that form the final root parent.
+        // Keep reducing so out_root is always produced for successful calls.
+        if (is_root && out_split_children && !split_children_captured) {
             out_split_children[0] = cvs[left_idx];
             out_split_children[1] = cvs[right_idx];
-            return;
+            split_children_captured = 1;
         }
 
         // Merge into the left slot
-        b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, &cvs[left_idx], &cvs[right_idx], &cvs[left_idx], is_root);
+        b3p_merge_nodes(ctx->kf.key, ctx->kf.flags, &cvs[left_idx], &cvs[right_idx], &cvs[left_idx], is_root && !out_split_children);
 
         // Update count and pop
         stack_counts[left_idx] = new_count;
@@ -1609,15 +1674,39 @@ static int b3p_compute_root(struct b3p_ctx* ctx, b3p_method_t method, b3_cv_byte
 
 /* Serial one-shot helper
    This is intended for small buffers where parallel setup would dominate */
-int b3p_hash_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], uint8_t flags, uint8_t* out, size_t out_len) {
-    // Validate required pointers for any non-trivial work
-    if (!input || !out || !key) {
+int b3p_hash_unkeyed_buffer_serial(const uint8_t* input, size_t input_len, uint8_t* out, size_t out_len) {
+    uint8_t iv_bytes[BLAKE3_KEY_LEN];
+    b3p_iv_bytes(iv_bytes);
+    return b3p_hash_raw_cv_buffer_serial(input, input_len, iv_bytes, 0, out, out_len);
+}
+
+int b3p_hash_keyed_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], uint8_t* out, size_t out_len) {
+    return b3p_hash_raw_cv_buffer_serial(input, input_len, key, KEYED_HASH, out, out_len);
+}
+
+int b3p_hash_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t cv[BLAKE3_KEY_LEN], b3p_flags_t flags, uint8_t* out, size_t out_len) {
+    return b3p_hash_raw_cv_buffer_serial(input, input_len, cv, flags, out, out_len);
+}
+
+int b3p_hash_raw_cv_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t cv[BLAKE3_KEY_LEN], b3p_flags_t flags, uint8_t* out, size_t out_len) {
+    if (!cv) {
+        return -1;
+    }
+    if (out_len > 0 && !out) {
+        return -1;
+    }
+    if (input_len > 0 && !input) {
         return -1;
     }
 
     // A zero-length output request is always a no-op success
     if (out_len == 0) {
         return 0;
+    }
+
+    uint8_t packed_flags = 0;
+    if (b3p_validate_and_pack_flags(flags, &packed_flags) != 0) {
+        return -1;
     }
 
     // Use a stack context so the caller doesn't need to allocate a b3p_ctx_t
@@ -1644,18 +1733,18 @@ int b3p_hash_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t
 
     ctx.num_chunks = num_chunks;
 
-    // Convert key bytes to little-endian u32 words once per call
+    // Convert CV bytes to little-endian u32 words once per call
     for (size_t i = 0; i < 8; i++) {
         uint32_t w = 0;
-        w |= (uint32_t)key[i * 4 + 0] << 0;
-        w |= (uint32_t)key[i * 4 + 1] << 8;
-        w |= (uint32_t)key[i * 4 + 2] << 16;
-        w |= (uint32_t)key[i * 4 + 3] << 24;
+        w |= (uint32_t)cv[i * 4 + 0] << 0;
+        w |= (uint32_t)cv[i * 4 + 1] << 8;
+        w |= (uint32_t)cv[i * 4 + 2] << 16;
+        w |= (uint32_t)cv[i * 4 + 3] << 24;
         ctx.kf.key[i] = w;
     }
 
     // Store flags for this call
-    ctx.kf.flags = flags;
+    ctx.kf.flags = packed_flags;
 
     // Fast path: a single chunk can be hashed directly and supports XOF output
     if (ctx.num_chunks == 1) {
@@ -1667,8 +1756,10 @@ int b3p_hash_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t
         // One-shot root always starts at chunk counter 0
         state.chunk_counter = 0;
 
-        // Feed the chunk (possibly empty) into the state
-        chunk_state_update(&state, ctx.input, ctx.input_len);
+        // Feed the chunk (possibly empty) into the state.
+        // Keep the pointer non-NULL for zero-length inputs to avoid libc edge-case UB.
+        const uint8_t* state_input = ctx.input_len ? ctx.input : (const uint8_t*)"";
+        chunk_state_update(&state, state_input, ctx.input_len);
 
         // Produce the output descriptor for the root
         output_t output = chunk_state_output(&state);

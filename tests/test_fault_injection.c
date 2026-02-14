@@ -536,10 +536,11 @@ void test_public_api_context(void) {
     assert(cfg.autotune_sample_mask == 63);
     assert(cfg.subtree_chunks == B3P_DEFAULT_SUBTREE_CHUNKS);
 
-    // Create_RejectsNullConfig
-    // b3p_create(NULL) == NULL
+    // Create_NullConfigUsesDefaults
+    // b3p_create(NULL) should use default config
     b3p_ctx_t* ctx = b3p_create(NULL);
-    assert(ctx == NULL);
+    assert(ctx != NULL);
+    b3p_destroy(ctx);
 
     // Create_SerialWhenNthreads1
     // cfg.nthreads=1 => ctx->pool.nthreads == 0 (disabled)
@@ -909,13 +910,15 @@ void test_reduction_functions(void) {
     split_children[1] = (b3_cv_bytes_t){0};
     b3p_reduce_stack(ctx, cvs_for_split, n_cvs2, 1, n_cvs2, &out_root, 1, split_children);
 
-    printf("parent_cv_calls=%d expected=%zu\n", g_parent_cv_calls, n_cvs2 - 2);
+    printf("parent_cv_calls=%d expected=%zu\n", g_parent_cv_calls, n_cvs2 - 1);
     printf("split0_first=%02x split1_first=%02x\n", split_children[0].bytes[0], split_children[1].bytes[0]);
 
-    assert(g_parent_cv_calls == (int)(n_cvs2 - 2));
+    // reduce_stack should now both capture split children and still produce out_root.
+    assert(g_parent_cv_calls == (int)(n_cvs2 - 1));
 
     b3_cv_bytes_t root_from_children = (b3_cv_bytes_t){0};
     xor_merge(&split_children[0], &split_children[1], &root_from_children);
+    assert(memcmp(out_root.bytes, root_from_children.bytes, 32) == 0);
     assert(memcmp(root_from_children.bytes, full_root.bytes, 32) == 0);
     printf("  Reduce_SplitChildrenCapturedAtRoot passed\n");
 

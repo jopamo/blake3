@@ -140,15 +140,10 @@ For small or streaming inputs, the standard API is usually better.
 uint8_t out[32];
 b3p_ctx_t *ctx = b3p_create(NULL);  // use default configuration
 
-// Unkeyed hash: pass a zero key and flags = 0
-uint8_t zero_key[BLAKE3_KEY_LEN] = {0};
-
-b3p_hash_one_shot(
+b3p_hash_unkeyed(
     ctx,
     input_buf,
     input_len,
-    zero_key,
-    0,
     B3P_METHOD_AUTO,
     out,
     sizeof(out)
@@ -179,12 +174,11 @@ This is useful when integrating into systems with known CPU topology.
 uint8_t key[BLAKE3_KEY_LEN] = { /* 32-byte key */ };
 uint8_t out[32];
 
-b3p_hash_one_shot(
+b3p_hash_keyed(
     ctx,
     input,
     len,
     key,
-    BLAKE3_KEYED_HASH,
     B3P_METHOD_AUTO,
     out,
     32
@@ -198,12 +192,10 @@ b3p_hash_one_shot(
 ```c
 uint8_t out[64];
 
-b3p_hash_one_shot_seek(
+b3p_hash_unkeyed_seek(
     ctx,
     input,
     len,
-    zero_key,
-    0,
     B3P_METHOD_AUTO,
     64,   // seek offset
     out,
@@ -216,17 +208,30 @@ b3p_hash_one_shot_seek(
 ### Serial fallback (no threads)
 
 ```c
-b3p_hash_buffer_serial(
+b3p_hash_unkeyed_buffer_serial(
     input,
     len,
-    zero_key,
-    0,
     out,
     32
 );
 ```
 
 This is useful for environments where thread creation is undesirable.
+
+---
+
+### Expert raw mode (advanced)
+
+If you need custom domains/flags, use the raw-CV entry points:
+
+```c
+uint8_t iv_cv[32]; // 32-byte initial CV, little-endian words
+b3p_hash_raw_cv_one_shot_seek(
+    ctx, input, len, iv_cv, B3P_FLAG_PARENT, B3P_METHOD_AUTO, 0, out, out_len
+);
+```
+
+`b3p_hash_raw_cv_*` is expert-only: for normal unkeyed hashing, prefer `b3p_hash_unkeyed*`.
 
 ---
 

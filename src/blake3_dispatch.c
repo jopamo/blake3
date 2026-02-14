@@ -210,7 +210,7 @@ void blake3_compress_in_place(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_L
     const enum cpu_feature features = get_cpu_features();
     MAYBE_UNUSED(features);
 #if !defined(BLAKE3_NO_AVX512)
-    if (features & AVX512VL) {
+    if ((features & (AVX512F | AVX512VL)) == (AVX512F | AVX512VL)) {
         blake3_compress_in_place_avx512(cv, block, block_len, counter, flags);
         return;
     }
@@ -242,7 +242,7 @@ void blake3_compress_xof(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_
     const enum cpu_feature features = get_cpu_features();
     MAYBE_UNUSED(features);
 #if !defined(BLAKE3_NO_AVX512)
-    if (features & AVX512VL) {
+    if ((features & (AVX512F | AVX512VL)) == (AVX512F | AVX512VL)) {
         blake3_compress_xof_avx512(cv, block, block_len, counter, flags, out);
         return;
     }
@@ -275,7 +275,7 @@ void blake3_xof_many(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN]
     const enum cpu_feature features = get_cpu_features();
     MAYBE_UNUSED(features);
 #if !defined(_WIN32) && !defined(BLAKE3_NO_AVX512)
-    if (features & AVX512VL) {
+    if ((features & (AVX512F | AVX512VL)) == (AVX512F | AVX512VL)) {
         blake3_xof_many_avx512(cv, block, block_len, counter, flags, out, outblocks);
         return;
     }
