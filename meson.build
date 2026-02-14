@@ -1,5 +1,5 @@
 project('b3sum', 'c',
-  version: '1.0.0',
+  version: '2.0.0',
   meson_version: '>=1.2.0',
   default_options: [
     'buildtype=release',
@@ -125,8 +125,8 @@ add_project_link_arguments(project_link_args, language: 'c')
 libblake3 = shared_library(
   'blake3',
   blake3_sources,
-  version: '1.0.0',
-  soversion: '1',
+  version: '2.0.0',
+  soversion: '2',
   install: true,
   install_dir: get_option('libdir'),
   c_args: simd_args + simd_defines,
@@ -235,6 +235,14 @@ test_parallel_edge_cases = executable(
   c_args: simd_args + simd_defines,
 )
 test('parallel_edge_cases', test_parallel_edge_cases)
+
+test_parallel_safe_contracts = executable(
+  'test_parallel_safe_contracts',
+  ['tests/test_parallel_safe_contracts.c'],
+  link_with: libblake3,
+  c_args: simd_args + simd_defines,
+)
+test('parallel_safe_contracts', test_parallel_safe_contracts)
 
 test('cli',
   find_program('tests/test_cli.sh'),

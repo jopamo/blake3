@@ -187,6 +187,28 @@ b3p_hash_keyed(
 
 ---
 
+### Derive-key hashing (safe)
+
+```c
+const uint8_t context[] = "com.example.kdf.v1";
+uint8_t out[32];
+
+b3p_hash_derive(
+    ctx,
+    input,
+    len,
+    context,
+    sizeof(context) - 1,
+    B3P_METHOD_AUTO,
+    out,
+    32
+);
+```
+
+You can also precompute the context key once with `b3p_init_derive(...)`.
+
+---
+
 ### Extendable output (XOF / seek)
 
 ```c
@@ -232,6 +254,19 @@ b3p_hash_raw_cv_one_shot_seek(
 ```
 
 `b3p_hash_raw_cv_*` is expert-only: for normal unkeyed hashing, prefer `b3p_hash_unkeyed*`.
+
+---
+
+### Migration from `b3p_hash_one_shot*`
+
+`b3p_hash_one_shot*` / `b3p_hash_buffer_serial` are legacy names and now explicit raw-CV aliases.
+For most use cases, migrate to safe wrappers first:
+
+* Unkeyed: use `b3p_hash_unkeyed*` instead of passing IV + `flags=0` manually.
+* Keyed: use `b3p_hash_keyed*` instead of passing `flags=KEYED_HASH` manually.
+* Derive-key mode: use `b3p_hash_derive*` (and optional `b3p_init_derive`) instead of raw `DERIVE_KEY_*` wiring.
+
+ABI note: legacy exported signatures changed in this release, and the shared library `SONAME` is bumped to `2`.
 
 ---
 
