@@ -420,6 +420,31 @@ int b3p_hash_keyed_seek(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, 
     return b3p_hash_raw_cv_one_shot_seek(ctx, input, input_len, key, KEYED_HASH, method, seek, out, out_len);
 }
 
+int b3p_init_derive(const void* context, size_t context_len, uint8_t out_context_key[BLAKE3_KEY_LEN]) {
+    uint8_t iv_bytes[BLAKE3_KEY_LEN];
+    if (!out_context_key) {
+        return -1;
+    }
+    if (context_len > 0 && !context) {
+        return -1;
+    }
+    b3p_iv_bytes(iv_bytes);
+    return b3p_hash_raw_cv_buffer_serial((const uint8_t*)context, context_len, iv_bytes, DERIVE_KEY_CONTEXT, out_context_key, BLAKE3_KEY_LEN);
+}
+
+int b3p_hash_derive(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const void* context, size_t context_len, b3p_method_t method, uint8_t* out, size_t out_len) {
+    return b3p_hash_derive_seek(ctx, input, input_len, context, context_len, method, 0, out, out_len);
+}
+
+int b3p_hash_derive_seek(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const void* context, size_t context_len, b3p_method_t method, uint64_t seek, uint8_t* out, size_t out_len) {
+    uint8_t context_key[BLAKE3_KEY_LEN];
+    int rc = b3p_init_derive(context, context_len, context_key);
+    if (rc != 0) {
+        return rc;
+    }
+    return b3p_hash_raw_cv_one_shot_seek(ctx, input, input_len, context_key, DERIVE_KEY_MATERIAL, method, seek, out, out_len);
+}
+
 int b3p_hash_raw_cv_one_shot(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t cv[BLAKE3_KEY_LEN], b3p_flags_t flags, b3p_method_t method, uint8_t* out, size_t out_len) {
     return b3p_hash_raw_cv_one_shot_seek(ctx, input, input_len, cv, flags, method, 0, out, out_len);
 }
@@ -1682,6 +1707,15 @@ int b3p_hash_unkeyed_buffer_serial(const uint8_t* input, size_t input_len, uint8
 
 int b3p_hash_keyed_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], uint8_t* out, size_t out_len) {
     return b3p_hash_raw_cv_buffer_serial(input, input_len, key, KEYED_HASH, out, out_len);
+}
+
+int b3p_hash_derive_buffer_serial(const uint8_t* input, size_t input_len, const void* context, size_t context_len, uint8_t* out, size_t out_len) {
+    uint8_t context_key[BLAKE3_KEY_LEN];
+    int rc = b3p_init_derive(context, context_len, context_key);
+    if (rc != 0) {
+        return rc;
+    }
+    return b3p_hash_raw_cv_buffer_serial(input, input_len, context_key, DERIVE_KEY_MATERIAL, out, out_len);
 }
 
 int b3p_hash_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t cv[BLAKE3_KEY_LEN], b3p_flags_t flags, uint8_t* out, size_t out_len) {

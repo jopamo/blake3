@@ -56,9 +56,18 @@ BLAKE3_API int b3p_hash_unkeyed_seek(b3p_ctx_t* ctx, const uint8_t* input, size_
 BLAKE3_API int b3p_hash_keyed(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], b3p_method_t method, uint8_t* out, size_t out_len);
 BLAKE3_API int b3p_hash_keyed_seek(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], b3p_method_t method, uint64_t seek, uint8_t* out, size_t out_len);
 
+/* BLAKE3 derive-key mode.
+ * b3p_init_derive computes the context key from (context, context_len).
+ * b3p_hash_derive* then hashes input as DERIVE_KEY_MATERIAL.
+ */
+BLAKE3_API int b3p_init_derive(const void* context, size_t context_len, uint8_t out_context_key[BLAKE3_KEY_LEN]);
+BLAKE3_API int b3p_hash_derive(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const void* context, size_t context_len, b3p_method_t method, uint8_t* out, size_t out_len);
+BLAKE3_API int b3p_hash_derive_seek(b3p_ctx_t* ctx, const uint8_t* input, size_t input_len, const void* context, size_t context_len, b3p_method_t method, uint64_t seek, uint8_t* out, size_t out_len);
+
 /* Safe public serial helpers. */
 BLAKE3_API int b3p_hash_unkeyed_buffer_serial(const uint8_t* input, size_t input_len, uint8_t* out, size_t out_len);
 BLAKE3_API int b3p_hash_keyed_buffer_serial(const uint8_t* input, size_t input_len, const uint8_t key[BLAKE3_KEY_LEN], uint8_t* out, size_t out_len);
+BLAKE3_API int b3p_hash_derive_buffer_serial(const uint8_t* input, size_t input_len, const void* context, size_t context_len, uint8_t* out, size_t out_len);
 
 /* Expert raw APIs.
  * `cv` is the initial chaining value encoded as 32 little-endian bytes.
